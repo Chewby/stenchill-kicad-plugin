@@ -1,0 +1,19 @@
+# IDE
+/.idea/
+*.swp
+*.swo
+*~
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+
+# Build artifacts
+*.zip
+
+# macOS
+.DS_Store
+
+# Plugin user settings
+settings.json
