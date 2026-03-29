@@ -37,10 +37,10 @@
             "version": "26.3.1",
             "status": "stable",
             "kicad_version": "8.0",
-            "download_url": "https://github.com/Chewby/stenchill-kicad-plugin/releases/download/v26.3.1/stenchill-kicad-plugin-26.3.1.zip",
-            "download_sha256": "67423f351162300f5faeca141351db6b4e2678170944849a6648baa28adb078c",
-            "download_size": 28759,
-            "install_size": 48342
+            "download_url": "",
+            "download_sha256": "",
+            "download_size": 0,
+            "install_size": 0
         }
     ]
 }
