@@ -1,5 +1,5 @@
 {
-    "$schema": "https://go.kicad.org/pcm/schemas/v1",
+    "$schema": "https://go.kicad.org/pcm/schemas/v2",
     "name": "Stenchill",
     "description": "Generate 3D-printable solder paste stencils from your PCB. Exports paste layers, sends them to stenchill.com, and saves ready-to-print STL files.",
     "description_full": "Stenchill generates 3D-printable solder paste stencils directly from your PCB design.\n\nFeatures:\n- One-click export of paste layers and board outline\n- Configurable stencil thickness, pad shrink, and nozzle compensation\n- Optional registration shoulders for precise PCB alignment\n- Downloads STL files ready for your 3D printer slicer\n\nHow it works:\n1. Click the Stenchill button in the KiCad toolbar\n2. Adjust parameters (thickness, shoulders, nozzle size...)\n3. Click Generate — the plugin exports Gerbers, sends them to the Stenchill API, and saves STL files next to your PCB\n\nRequires an internet connection. Files are processed on stenchill.com and not stored on the server.\n\nMore info: https://www.stenchill.com",
@@ -23,12 +23,12 @@
     "resources": {
         "homepage": "https://www.stenchill.com",
         "issues": "https://github.com/Chewby/stenchill-kicad-plugin/issues",
-        "source_repo": "https://github.com/Chewby/stenchill-kicad-plugin"
+        "source": "https://github.com/Chewby/stenchill-kicad-plugin"
     },
     "tags": [
         "stencil",
         "solder-paste",
-        "3d-printing",
+        "printing-3d",
         "fabrication",
         "stl"
     ],
@@ -36,11 +36,7 @@
         {
             "version": "26.3.1",
             "status": "stable",
-            "kicad_version": "8.0",
-            "download_url": "",
-            "download_sha256": "",
-            "download_size": 0,
-            "install_size": 0
+            "kicad_version": "8.0"
         }
     ]
 }
