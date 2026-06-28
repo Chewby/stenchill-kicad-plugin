@@ -34,10 +34,13 @@ class StenchillPlugin(pcbnew.ActionPlugin):
             return
 
         from .dialog import StenchillDialog
-        import wx
 
-        parent = wx.GetTopLevelWindows()[0] if wx.GetTopLevelWindows() else None
-        dlg = StenchillDialog(parent, board)
+        # No parent on purpose. KiCad 10 runs as a single process with several
+        # top-level frames, and wx.GetTopLevelWindows()[0] is the project
+        # manager frame, not the PCB editor. Parenting a modal dialog to the
+        # project manager and then dismissing it closes the whole KiCad window.
+        # An app-modal dialog with no parent has no frame to cascade onto.
+        dlg = StenchillDialog(None, board)
         dlg.ShowModal()
         dlg.Destroy()
 

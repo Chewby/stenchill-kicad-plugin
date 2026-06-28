@@ -5,6 +5,8 @@ Author: Thomas COTTARD - https://www.stenchill.com
 
 import json
 import os
+import subprocess
+import sys
 import threading
 import zipfile
 from datetime import datetime
@@ -14,11 +16,25 @@ import wx.adv
 import pcbnew
 
 
+def _open_in_file_manager(path: str) -> None:
+    """Open a folder in the OS file manager. Best-effort; never raises."""
+    try:
+        if sys.platform == "darwin":
+            subprocess.run(["open", path], check=False)
+        elif sys.platform == "win32":
+            os.startfile(path)  # noqa: only exists on Windows; reached only here
+        else:
+            subprocess.run(["xdg-open", path], check=False)
+    except Exception:
+        pass
+
+
 # Default parameter values matching the Stenchill web UI
 _DEFAULTS = {
     "thickness": 0.4,
     "shrink": 0.0,
     "nozzle_diameter": 0.4,
+    "enable_slotify": True,
     "enable_shoulders": True,
     "pcb_thickness": 1.6,
     "shoulder_length": 15.0,
@@ -52,16 +68,88 @@ def _save_settings(params: dict) -> None:
         pass
 
 
+def _reset_saved_params() -> None:
+    """Reset only the generation-parameter keys in the persisted settings back to
+    their defaults, preserving any other keys (e.g. a future export path). Never
+    deletes the file wholesale, so nothing outside _DEFAULTS is ever touched."""
+    data = {}
+    try:
+        with open(_SETTINGS_FILE, "r") as f:
+            data = json.load(f)
+    except (FileNotFoundError, json.JSONDecodeError):
+        data = {}
+    if not isinstance(data, dict):
+        data = {}
+    data.update(_DEFAULTS)
+    _save_settings(data)
+
+
+class _ConfirmDialog(wx.Dialog):
+    """Small Stenchill-branded Yes/No confirmation (the native wx.MessageBox
+    shows the host app icon — KiCad — on macOS, which we can't replace)."""
+
+    def __init__(self, parent, title, message):
+        super().__init__(parent, title=title)
+        panel = wx.Panel(self)
+        sizer = wx.BoxSizer(wx.VERTICAL)
+
+        logo_path = os.path.join(os.path.dirname(__file__), "icon-96.png")
+        if os.path.exists(logo_path):
+            img = wx.Image(logo_path, wx.BITMAP_TYPE_PNG).Scale(48, 48, wx.IMAGE_QUALITY_BICUBIC)
+            sizer.Add(wx.StaticBitmap(panel, bitmap=wx.Bitmap(img)), 0, wx.TOP | wx.ALIGN_CENTER, 16)
+
+        heading = wx.StaticText(panel, label=title)
+        heading_font = heading.GetFont()
+        heading_font.SetWeight(wx.FONTWEIGHT_BOLD)
+        heading.SetFont(heading_font)
+        sizer.Add(heading, 0, wx.LEFT | wx.RIGHT | wx.TOP | wx.ALIGN_CENTER, 16)
+
+        text = wx.StaticText(panel, label=message, style=wx.ALIGN_CENTER)
+        sizer.Add(text, 0, wx.ALL | wx.ALIGN_CENTER, 16)
+
+        btns = wx.BoxSizer(wx.HORIZONTAL)
+        no_btn = wx.Button(panel, wx.ID_NO, "No")
+        no_btn.SetDefault()  # safe default: Enter does not confirm a destructive action
+        no_btn.Bind(wx.EVT_BUTTON, lambda e: self.EndModal(wx.ID_NO))
+        btns.Add(no_btn, 0, wx.RIGHT, 8)
+        yes_btn = wx.Button(panel, wx.ID_YES, "Yes")
+        yes_btn.Bind(wx.EVT_BUTTON, lambda e: self.EndModal(wx.ID_YES))
+        btns.Add(yes_btn, 0)
+        sizer.Add(btns, 0, wx.ALL | wx.ALIGN_CENTER, 12)
+
+        panel.SetSizerAndFit(sizer)
+        self.Fit()
+        self.CenterOnParent()
+
+
+def _confirm(parent, title, message) -> bool:
+    """Show the Stenchill confirmation dialog; return True if the user chose Yes."""
+    dlg = _ConfirmDialog(parent, title, message)
+    result = dlg.ShowModal()
+    dlg.Destroy()
+    return result == wx.ID_YES
+
+
 class StenchillDialog(wx.Dialog):
     """Main dialog for Stenchill stencil generation."""
 
     def __init__(self, parent, board):
-        super().__init__(parent, title=f"Stenchill - Stencil Generator v{VERSION}", size=(480, 680))
+        super().__init__(parent, title=f"Stenchill - Stencil Generator v{VERSION}", size=(560, 680))
         self.board = board
         self.result_path = None
+        # Generation state: _generating drives the dismiss button label
+        # (Quit/Cancel); _gen_token invalidates a cancelled worker's late
+        # wx.CallAfter callbacks so they don't rewrite the UI.
+        self._generating = False
+        self._gen_token = 0
+        self._last_gen_dir = None
         self._settings = _load_settings()
         self._build_ui()
         self.CenterOnParent()
+        # Route the window [X] / Escape through our own handler so it only
+        # closes this dialog, never the parent PCB view.
+        self.Bind(wx.EVT_CLOSE, self._on_close)
+        threading.Thread(target=self._check_for_update, daemon=True).start()
 
     def _build_ui(self):
         panel = wx.Panel(self)
@@ -95,15 +183,27 @@ class StenchillDialog(wx.Dialog):
         link.SetVisitedColour(link.GetNormalColour())
         main_sizer.Add(link, 0, wx.ALIGN_CENTER | wx.BOTTOM, 10)
 
+        self.update_text = wx.StaticText(panel, label="")
+        self.update_text.SetForegroundColour(wx.Colour(180, 95, 0))
+        main_sizer.Add(self.update_text, 0, wx.ALIGN_CENTER | wx.BOTTOM, 4)
+        self.update_link = wx.adv.HyperlinkCtrl(
+            panel, label="Update via KiCad's Plugin Manager",
+            url="https://www.stenchill.com/en/kicad-plugin",
+        )
+        self.update_link.SetVisitedColour(self.update_link.GetNormalColour())
+        main_sizer.Add(self.update_link, 0, wx.ALIGN_CENTER | wx.BOTTOM, 6)
+        main_sizer.Show(self.update_text, False)
+        main_sizer.Show(self.update_link, False)
+
         main_sizer.Add(wx.StaticLine(panel), 0, wx.EXPAND | wx.ALL, 5)
 
-        # ── Stencil Parameters ──
+        # Stencil parameters — bounds aligned with the web frontend and server.
         stencil_box = wx.StaticBoxSizer(wx.VERTICAL, panel, "Stencil Parameters")
         grid = wx.FlexGridSizer(3, 2, 8, 16)
         grid.AddGrowableCol(1, 1)
 
         self.thickness_ctrl = self._add_param(
-            panel, grid, "Thickness (mm):", self._settings["thickness"], 0.05, 10.0,
+            panel, grid, "Thickness (mm):", self._settings["thickness"], 0.05, 1.0,
             "Stencil plate thickness - typical: 0.3-0.4 mm"
         )
         self.shrink_ctrl = self._add_param(
@@ -111,11 +211,20 @@ class StenchillDialog(wx.Dialog):
             "Pad reduction - negative values enlarge pads"
         )
         self.nozzle_ctrl = self._add_param(
-            panel, grid, "Nozzle (mm), 0.2 rec.:", self._settings["nozzle_diameter"], 0.1, 2.0,
+            panel, grid, "Nozzle (mm), 0.2 rec.:", self._settings["nozzle_diameter"], 0.1, 1.5,
             "Your 3D printer nozzle size - 0.2 mm recommended for best results"
         )
 
         stencil_box.Add(grid, 0, wx.EXPAND | wx.ALL, 8)
+
+        self.slotify_cb = wx.CheckBox(panel, label="Merge close pads")
+        self.slotify_cb.SetValue(self._settings["enable_slotify"])
+        self.slotify_cb.SetToolTip(
+            "Fuse fine-pitch pad rows into a single slot when the gap between "
+            "pads is narrower than the nozzle, avoiding sub-nozzle walls."
+        )
+        stencil_box.Add(self.slotify_cb, 0, wx.LEFT | wx.RIGHT | wx.BOTTOM, 8)
+
         main_sizer.Add(stencil_box, 0, wx.EXPAND | wx.ALL, 10)
 
         # ── Shoulder Parameters ──
@@ -130,19 +239,19 @@ class StenchillDialog(wx.Dialog):
         self.shoulder_grid.AddGrowableCol(1, 1)
 
         self.pcb_thickness_ctrl = self._add_param(
-            panel, self.shoulder_grid, "PCB thickness (mm):", self._settings["pcb_thickness"], 0.1, 10.0,
+            panel, self.shoulder_grid, "PCB thickness (mm):", self._settings["pcb_thickness"], 0.1, 5.0,
             "Your PCB board thickness"
         )
         self.shoulder_length_ctrl = self._add_param(
-            panel, self.shoulder_grid, "Shoulder length (mm):", self._settings["shoulder_length"], 1.0, 500.0,
+            panel, self.shoulder_grid, "Shoulder length (mm):", self._settings["shoulder_length"], 1.0, 200.0,
             "L-bracket length along PCB edge"
         )
         self.shoulder_width_ctrl = self._add_param(
-            panel, self.shoulder_grid, "Shoulder width (mm):", self._settings["shoulder_width"], 0.5, 50.0,
+            panel, self.shoulder_grid, "Shoulder width (mm):", self._settings["shoulder_width"], 0.5, 15.0,
             "L-bracket wall thickness"
         )
         self.shoulder_clearance_ctrl = self._add_param(
-            panel, self.shoulder_grid, "Clearance (mm):", self._settings["shoulder_clearance"], 0.0, 5.0,
+            panel, self.shoulder_grid, "Clearance (mm):", self._settings["shoulder_clearance"], 0.0, 2.0,
             "Gap between PCB edge and shoulder walls"
         )
 
@@ -175,10 +284,16 @@ class StenchillDialog(wx.Dialog):
         self.result_text = wx.StaticText(panel, label="")
         main_sizer.Add(self.result_text, 0, wx.LEFT | wx.RIGHT | wx.TOP, 10)
 
+        self.open_folder_btn = wx.Button(panel, wx.ID_ANY, "\U0001F4C1  Open folder")
+        self.open_folder_btn.SetToolTip("Open the output folder in your file manager")
+        self.open_folder_btn.Bind(wx.EVT_BUTTON, self._on_open_folder)
+        main_sizer.Add(self.open_folder_btn, 0, wx.LEFT | wx.RIGHT | wx.TOP, 10)
+
         # Initially hide all status widgets
         main_sizer.Show(self.progress, False)
         main_sizer.Show(self.status_text, False)
         main_sizer.Show(self.result_text, False)
+        main_sizer.Show(self.open_folder_btn, False)
 
         # ── Spacer to push buttons to bottom ──
         main_sizer.AddStretchSpacer()
@@ -186,20 +301,50 @@ class StenchillDialog(wx.Dialog):
         # ── Bottom bar: support link + buttons ──
         bottom_sizer = wx.BoxSizer(wx.HORIZONTAL)
 
-        support_link = wx.adv.HyperlinkCtrl(
-            panel, label="\u2615  Support this project",
-            url="https://paypal.me/thomascottard"
+        # \u2500\u2500 Support links (Ko-fi + PayPal) \u2500\u2500
+        def _small_font(ctrl):
+            f = ctrl.GetFont()
+            f.SetPointSize(f.GetPointSize() - 1)
+            ctrl.SetFont(f)
+
+        support_label = wx.StaticText(panel, label="Like it?  ")
+        support_label.SetForegroundColour(wx.Colour(120, 120, 120))
+        _small_font(support_label)
+        bottom_sizer.Add(support_label, 0, wx.ALIGN_CENTER_VERTICAL)
+
+        kofi_link = wx.adv.HyperlinkCtrl(
+            panel, label="\u2615  Ko-fi", url="https://ko-fi.com/thomascottard"
         )
-        support_link.SetVisitedColour(support_link.GetNormalColour())
-        support_font = support_link.GetFont()
-        support_font.SetPointSize(support_font.GetPointSize() - 1)
-        support_link.SetFont(support_font)
-        bottom_sizer.Add(support_link, 0, wx.ALIGN_CENTER_VERTICAL)
+        kofi_link.SetVisitedColour(kofi_link.GetNormalColour())
+        _small_font(kofi_link)
+        bottom_sizer.Add(kofi_link, 0, wx.ALIGN_CENTER_VERTICAL)
+
+        sep = wx.StaticText(panel, label="  \u00b7  ")
+        sep.SetForegroundColour(wx.Colour(120, 120, 120))
+        _small_font(sep)
+        bottom_sizer.Add(sep, 0, wx.ALIGN_CENTER_VERTICAL)
+
+        paypal_link = wx.adv.HyperlinkCtrl(
+            panel, label="PayPal", url="https://paypal.me/thomascottard"
+        )
+        paypal_link.SetVisitedColour(paypal_link.GetNormalColour())
+        _small_font(paypal_link)
+        bottom_sizer.Add(paypal_link, 0, wx.ALIGN_CENTER_VERTICAL)
 
         bottom_sizer.AddStretchSpacer()
 
-        cancel_btn = wx.Button(panel, wx.ID_CANCEL, "Cancel")
-        bottom_sizer.Add(cancel_btn, 0, wx.RIGHT, 8)
+        # Dynamic dismiss button: "Quit" when idle (closes only this dialog),
+        # "Cancel" during a generation (returns to the form). Custom ID + explicit
+        # handler avoid the standard wx.ID_CANCEL default dismissal, which on
+        # macOS/KiCad could propagate and close the parent PCB view.
+        self.reset_btn = wx.Button(panel, wx.ID_ANY, "Reset params")
+        self.reset_btn.SetToolTip("Reset all parameters to their default values")
+        self.reset_btn.Bind(wx.EVT_BUTTON, self._on_reset)
+        bottom_sizer.Add(self.reset_btn, 0, wx.RIGHT, 8)
+
+        self.dismiss_btn = wx.Button(panel, wx.ID_ANY, "Quit")
+        self.dismiss_btn.Bind(wx.EVT_BUTTON, self._on_dismiss)
+        bottom_sizer.Add(self.dismiss_btn, 0, wx.RIGHT, 8)
 
         self.generate_btn = wx.Button(panel, wx.ID_OK, "Generate Stencil")
         self.generate_btn.SetDefault()
@@ -221,8 +366,14 @@ class StenchillDialog(wx.Dialog):
         lbl.SetToolTip(tooltip)
         grid.Add(lbl, 0, wx.ALIGN_CENTER_VERTICAL)
 
-        ctrl = wx.SpinCtrlDouble(panel, value=str(default), min=min_val, max=max_val, inc=0.05)
+        # Set the value as a float via SetValue, NOT via the constructor's string
+        # `value`. str(default) is always "."-formatted ("0.4"), which a
+        # SpinCtrlDouble on a comma-decimal locale (FR, DE, ...) misparses (e.g.
+        # 0.4 -> 4). SetValue(float) formats per the system locale; GetValue()
+        # returns a locale-independent float.
+        ctrl = wx.SpinCtrlDouble(panel, min=min_val, max=max_val, inc=0.05)
         ctrl.SetDigits(2)
+        ctrl.SetValue(float(default))
         ctrl.SetToolTip(tooltip)
         grid.Add(ctrl, 1, wx.EXPAND)
 
@@ -239,9 +390,14 @@ class StenchillDialog(wx.Dialog):
     def _on_generate(self, event):
         """Start the generation process in a background thread."""
         self.generate_btn.Disable()
+        self.reset_btn.Disable()
+        self._generating = True
+        self._gen_token += 1
+        self.dismiss_btn.SetLabel("Cancel")
         self.main_sizer.Show(self.progress, True)
         self.main_sizer.Show(self.status_text, True)
         self.main_sizer.Show(self.result_text, False)
+        self.main_sizer.Show(self.open_folder_btn, False)
         self.status_text.SetForegroundColour(wx.Colour(100, 100, 100))
         self.status_text.SetLabel("Exporting Gerber layers...")
         self.progress.SetRange(100)
@@ -253,6 +409,7 @@ class StenchillDialog(wx.Dialog):
             "thickness": self.thickness_ctrl.GetValue(),
             "shrink": self.shrink_ctrl.GetValue(),
             "nozzle_diameter": self.nozzle_ctrl.GetValue(),
+            "enable_slotify": self.slotify_cb.GetValue(),
             "enable_shoulders": self.shoulders_cb.GetValue(),
             "pcb_thickness": self.pcb_thickness_ctrl.GetValue(),
             "shoulder_length": self.shoulder_length_ctrl.GetValue(),
@@ -275,36 +432,45 @@ class StenchillDialog(wx.Dialog):
 
         thread = threading.Thread(
             target=self._generate_worker,
-            args=(zip_path, params, output_dir, board_name),
+            args=(zip_path, params, output_dir, board_name, self._gen_token),
             daemon=True,
         )
         thread.start()
 
-    def _generate_worker(self, zip_path, params, output_dir, board_name):
-        """Background worker: call API with SSE streaming, save results."""
+    def _generate_worker(self, zip_path, params, output_dir, board_name, token):
+        """Background worker: call API with SSE streaming, save results.
+
+        ``token`` is the generation id captured at launch. Every UI update goes
+        through ``ui()``, which drops the update if the user has cancelled or
+        started another generation (token no longer current) — so a cancelled
+        run can never rewrite the form or a freshly destroyed dialog.
+        """
+        def ui(fn, *fargs):
+            def _apply():
+                if token == self._gen_token:
+                    fn(*fargs)
+            wx.CallAfter(_apply)
+
         result_zip = None
+        from .api_client import generate_stencil_stream, compose_progress_label
         try:
-            wx.CallAfter(self._set_status, "Connecting to Stenchill...")
+            ui(self._set_status, "Connecting to Stenchill...")
 
-            progress_labels = {
-                "PROGRESS.EXTRACTING_PADS": "Extracting pads...",
-                "PROGRESS.MORPHOLOGICAL_CLOSE": "Merging split pads...",
-                "PROGRESS.NOZZLE_COMPENSATION": "Nozzle compensation...",
-                "PROGRESS.EXTRUSION_3D": "3D extrusion...",
-                "PROGRESS.EXPORTING": "Exporting STL/3MF...",
-            }
-
-            def on_progress(step, total, label):
+            def on_progress(step, total, label, label_text, face_progress):
                 percent = int((step / total) * 100) if total > 0 else 0
-                text = progress_labels.get(label, label)
-                wx.CallAfter(self._set_progress, percent, text)
+                text = compose_progress_label(label, label_text, face_progress)
+                ui(self._set_progress, percent, text)
+
+            def on_queued(position, queue_depth, eta_seconds):
+                eta_str = f" · ETA ~{eta_seconds}s" if eta_seconds > 0 else ""
+                ui(self._set_status, f"Position {position} of {queue_depth}{eta_str}")
 
             # Step 1: Call streaming API
-            from .api_client import generate_stencil_stream, ApiError
             try:
                 result_zip = generate_stencil_stream(
                     zip_path=zip_path,
                     on_progress=on_progress,
+                    on_queued=on_queued,
                     thickness=params["thickness"],
                     shrink=params["shrink"],
                     pcb_thickness=params["pcb_thickness"],
@@ -313,13 +479,20 @@ class StenchillDialog(wx.Dialog):
                     enable_shoulders=params["enable_shoulders"],
                     shoulder_clearance=params["shoulder_clearance"],
                     nozzle_diameter=params["nozzle_diameter"],
+                    enable_slotify=params["enable_slotify"],
                 )
             finally:
                 # Clean up temp Gerber ZIP
                 if os.path.exists(zip_path):
                     os.unlink(zip_path)
 
-            wx.CallAfter(self._set_status, "Saving STL files...")
+            # Cancelled (or the dialog was closed) while generating: drop the
+            # result instead of writing STL files to the output folder. The
+            # outer finally still cleans up the downloaded result_zip.
+            if token != self._gen_token:
+                return
+
+            ui(self._set_status, "Saving STL files...")
 
             # Step 2: Create subfolder and extract STL files
             timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
@@ -332,21 +505,25 @@ class StenchillDialog(wx.Dialog):
                     safe_name = os.path.basename(name)
                     if not safe_name or safe_name.startswith('.'):
                         continue
-                    if safe_name.lower().endswith((".stl", ".3mf")):
-                        dest = os.path.join(gen_dir, safe_name)
-                        with zf.open(name) as src, open(dest, "wb") as dst:
-                            dst.write(src.read())
+                    is_mesh = safe_name.lower().endswith((".stl", ".3mf"))
+                    is_credits = safe_name == "CREDITS.txt"
+                    if not (is_mesh or is_credits):
+                        continue
+                    dest = os.path.join(gen_dir, safe_name)
+                    with zf.open(name) as src, open(dest, "wb") as dst:
+                        dst.write(src.read())
+                    if is_mesh:
                         saved_files.append(safe_name)
 
             if saved_files:
                 files_str = ", ".join(saved_files)
                 folder_name = os.path.basename(gen_dir)
-                wx.CallAfter(self._on_success, f"Saved: {files_str}\nFolder: {folder_name}")
+                ui(self._on_success, f"Saved: {files_str}\nFolder: {folder_name}", gen_dir)
             else:
-                wx.CallAfter(self._on_error, "No STL files found in the API response.")
+                ui(self._on_error, "No STL files found in the API response.")
 
         except Exception as e:
-            wx.CallAfter(self._on_error, str(e))
+            ui(self._on_error, str(e))
         finally:
             if result_zip and os.path.exists(result_zip):
                 os.unlink(result_zip)
@@ -360,20 +537,107 @@ class StenchillDialog(wx.Dialog):
         if label:
             self.status_text.SetLabel(label)
 
-    def _on_success(self, message):
+    def _on_success(self, message, gen_dir):
+        self._generating = False
+        self._last_gen_dir = gen_dir
+        self.dismiss_btn.SetLabel("Quit")
         self.main_sizer.Show(self.progress, False)
         self.main_sizer.Show(self.status_text, False)
         self.main_sizer.Show(self.result_text, True)
+        self.main_sizer.Show(self.open_folder_btn, True)
         self.generate_btn.Enable()
+        self.reset_btn.Enable()
         self.result_text.SetForegroundColour(wx.Colour(0, 128, 0))
         self.result_text.SetLabel(f"\u2705  {message}")
         self.panel.Layout()
 
     def _on_error(self, message):
+        self._generating = False
+        self.dismiss_btn.SetLabel("Quit")
         self.main_sizer.Show(self.progress, False)
         self.main_sizer.Show(self.status_text, False)
         self.main_sizer.Show(self.result_text, True)
+        self.main_sizer.Show(self.open_folder_btn, False)
         self.generate_btn.Enable()
+        self.reset_btn.Enable()
         self.result_text.SetForegroundColour(wx.Colour(200, 0, 0))
         self.result_text.SetLabel(f"\u274c  Error: {message}")
         self.panel.Layout()
+
+    def _on_dismiss(self, event):
+        """Bottom button: cancel the running generation, or close the dialog."""
+        if self._generating:
+            self._cancel_generation()
+        else:
+            self._close_dialog()
+
+    def _cancel_generation(self):
+        """Abandon the UI wait and return to the idle form. Invalidates the
+        running worker's callbacks (via _gen_token); the background request may
+        still finish server-side, but its result is ignored."""
+        self._gen_token += 1
+        self._generating = False
+        self.dismiss_btn.SetLabel("Quit")
+        self.generate_btn.Enable()
+        self.reset_btn.Enable()
+        self.main_sizer.Show(self.progress, False)
+        self.main_sizer.Show(self.status_text, False)
+        self.main_sizer.Show(self.result_text, False)
+        self.main_sizer.Show(self.open_folder_btn, False)
+        self.panel.Layout()
+
+    def _on_open_folder(self, event):
+        """Open the last generation's output folder in the OS file manager."""
+        if self._last_gen_dir and os.path.isdir(self._last_gen_dir):
+            _open_in_file_manager(self._last_gen_dir)
+
+    def _on_reset(self, event):
+        """Reset all generation parameters to their defaults, after confirmation.
+        Leaves the output folder untouched."""
+        if not _confirm(self, "Reset params",
+                        "Reset all parameters to their default values?"):
+            return
+        self.thickness_ctrl.SetValue(_DEFAULTS["thickness"])
+        self.shrink_ctrl.SetValue(_DEFAULTS["shrink"])
+        self.nozzle_ctrl.SetValue(_DEFAULTS["nozzle_diameter"])
+        self.slotify_cb.SetValue(_DEFAULTS["enable_slotify"])
+        self.shoulders_cb.SetValue(_DEFAULTS["enable_shoulders"])
+        self.pcb_thickness_ctrl.SetValue(_DEFAULTS["pcb_thickness"])
+        self.shoulder_length_ctrl.SetValue(_DEFAULTS["shoulder_length"])
+        self.shoulder_width_ctrl.SetValue(_DEFAULTS["shoulder_width"])
+        self.shoulder_clearance_ctrl.SetValue(_DEFAULTS["shoulder_clearance"])
+        self._on_shoulder_toggle(None)
+        self._settings = dict(_DEFAULTS)
+        _reset_saved_params()
+
+    def _on_close(self, event):
+        """Window [X] / Escape: invalidate any in-flight worker callbacks, then
+        close ONLY this dialog (never the parent PCB view)."""
+        self._gen_token += 1
+        self._generating = False
+        self._close_dialog()
+
+    def _close_dialog(self):
+        """Dismiss this dialog alone: EndModal when shown via ShowModal,
+        otherwise Destroy. Never touches the parent frame."""
+        if self.IsModal():
+            self.EndModal(wx.ID_CANCEL)
+        else:
+            self.Destroy()
+
+    def _check_for_update(self):
+        """Background: poll the API for the latest plugin version; reveal the
+        update notice if newer. Silent on any failure."""
+        from .api_client import fetch_latest_version, is_newer
+        latest = fetch_latest_version()
+        if latest and is_newer(latest, VERSION):
+            wx.CallAfter(self._show_update_notice, latest)
+
+    def _show_update_notice(self, latest):
+        try:
+            self.update_text.SetLabel(f"New version v{latest} available")
+            self.main_sizer.Show(self.update_text, True)
+            self.main_sizer.Show(self.update_link, True)
+            self.panel.Layout()
+        except RuntimeError:
+            pass  # dialog was closed before the version check returned

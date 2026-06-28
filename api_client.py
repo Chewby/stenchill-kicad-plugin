@@ -3,6 +3,11 @@ Stenchill API client - sends Gerber ZIP to the public API and retrieves the STL 
 Author: Thomas COTTARD - https://www.stenchill.com
 """
 
+# Defer annotation evaluation so PEP 604 unions (e.g. ``tuple | None``) don't run
+# at definition time. KiCad bundles Python 3.9, which predates PEP 604, so an
+# eagerly-evaluated ``X | None`` return annotation would raise TypeError at import.
+from __future__ import annotations
+
 import json
 import os
 import re
@@ -19,7 +24,7 @@ def _ssl_context() -> ssl.SSLContext:
     """Build an SSL context with broad OS compatibility.
 
     Resolution order:
-    1. certifi (if installed — best cross-platform option)
+    1. certifi (if installed - best cross-platform option)
     2. macOS: Homebrew / system OpenSSL cert bundles
     3. Default system certificates (works on Windows and most Linux)
     """
@@ -30,7 +35,7 @@ def _ssl_context() -> ssl.SSLContext:
     except ImportError:
         pass
 
-    # 2. macOS — Python shipped with KiCad often lacks root certs
+    # 2. macOS - Python shipped with KiCad often lacks root certs
     import sys
     if sys.platform == "darwin":
         mac_cert_paths = [
@@ -47,7 +52,12 @@ def _ssl_context() -> ssl.SSLContext:
     # 3. Default (Windows / Linux)
     return ssl.create_default_context()
 
-API_BASE = "https://www.stenchill.com/api/v1"
+# Public API base. Override with the STENCHILL_API_BASE env var to point the
+# plugin at a local/staging backend (e.g. http://localhost:8080/api/v1) for
+# testing; defaults to production. A trailing slash is tolerated.
+API_BASE = os.environ.get(
+    "STENCHILL_API_BASE", "https://www.stenchill.com/api/v1"
+).rstrip("/")
 STREAM_URL = f"{API_BASE}/generate/stream"
 # Client identification key (not a secret - used for rate limiting and source tracking)
 API_KEY = "stenchill-kicad-2026-xK9mP4wQ7rT2"
@@ -63,6 +73,70 @@ def _get_user_agent() -> str:
     return _user_agent
 
 
+def _parse_version(v) -> tuple | None:
+    """Parse 'AA.BB.CC' into a tuple of ints, or None if unparseable."""
+    try:
+        return tuple(int(part) for part in v.strip().split("."))
+    except (AttributeError, ValueError):
+        return None
+
+
+def is_newer(latest, current) -> bool:
+    """True if `latest` is a strictly higher version than `current`.
+
+    Any unparseable input returns False (never nag on a malformed version).
+    """
+    lv = _parse_version(latest)
+    cv = _parse_version(current)
+    if lv is None or cv is None:
+        return False
+    length = max(len(lv), len(cv))
+    lv = lv + (0,) * (length - len(lv))
+    cv = cv + (0,) * (length - len(cv))
+    return lv > cv
+
+
+def compose_progress_label(label, label_text, face_progress):
+    """Build the displayed progress text, mirroring the website's per-face
+    composition (`composeFaceProgressLabel`).
+
+    - 0 or 1 face -> the macro ``label_text`` (single face == the macro phase).
+    - multiple faces, none active -> ``label_text`` (macro already reflects
+      packaging/done).
+    - multiple faces with at least one active -> ``"Front: X · Back: Y"`` where a
+      done face shows ``"✓"`` and an active face shows its per-face ``labelText``.
+
+    Each ``face_progress`` entry is the SSE shape
+    ``{"face", "label", "labelText", "done"}``.
+    """
+    if not face_progress or len(face_progress) <= 1:
+        return label_text
+    active = [f for f in face_progress if not f.get("done")]
+    if not active:
+        return label_text
+    parts = []
+    for f in face_progress:
+        name = str(f.get("face", "")).capitalize() or "?"
+        text = "✓" if f.get("done") else (f.get("labelText") or f.get("label", ""))
+        parts.append(f"{name}: {text}")
+    return " · ".join(parts)
+
+
+def fetch_latest_version(timeout: int = 4) -> str | None:
+    """GET /plugin/version and return the latest version string, or None on any
+    network/parse error (the caller stays silent on failure)."""
+    url = f"{API_BASE}/plugin/version"
+    try:
+        req = Request(url, headers={"User-Agent": _get_user_agent()})
+        ctx = _ssl_context()
+        with urlopen(req, timeout=timeout, context=ctx) as resp:
+            data = json.loads(resp.read().decode("utf-8"))
+        latest = data.get("latest")
+        return latest if isinstance(latest, str) else None
+    except Exception:
+        return None
+
+
 class ApiError(Exception):
     """Raised when the Stenchill API returns an error."""
 
@@ -72,7 +146,8 @@ class ApiError(Exception):
 
 
 def _build_multipart(zip_path, thickness, shrink, pcb_thickness, shoulder_length,
-                     shoulder_width, enable_shoulders, shoulder_clearance, nozzle_diameter):
+                     shoulder_width, enable_shoulders, shoulder_clearance, nozzle_diameter,
+                     enable_slotify):
     """Build multipart body and headers for the API request."""
     boundary = f"----StenchillBoundary{uuid.uuid4().hex}"
 
@@ -94,6 +169,7 @@ def _build_multipart(zip_path, thickness, shrink, pcb_thickness, shoulder_length
         "enableShoulders": str(enable_shoulders).lower(),
         "shoulderClearance": str(shoulder_clearance),
         "nozzleDiameter": str(nozzle_diameter),
+        "enableSlotify": str(enable_slotify).lower(),
     }
 
     param_parts = b""
@@ -116,6 +192,7 @@ def _build_multipart(zip_path, thickness, shrink, pcb_thickness, shoulder_length
 def generate_stencil_stream(
     zip_path: str,
     on_progress=None,
+    on_queued=None,
     thickness: float = 0.4,
     shrink: float = 0.0,
     pcb_thickness: float = 1.6,
@@ -124,13 +201,15 @@ def generate_stencil_stream(
     enable_shoulders: bool = True,
     shoulder_clearance: float = 0.3,
     nozzle_diameter: float = 0.4,
+    enable_slotify: bool = True,
 ) -> str:
     """
-    SSE streaming generation - calls on_progress(step, total, label) and returns path to result ZIP.
+    SSE streaming generation - calls on_progress(step, total, label, label_text) and returns path to result ZIP.
 
     Args:
         zip_path: Path to the Gerber ZIP file.
-        on_progress: Callback(step: int, total: int, label: str) called for each progress event.
+        on_progress: Callback(step: int, total: int, label: str, label_text: str) called for each progress event.
+        on_queued: Callback(position: int, queue_depth: int, eta_seconds: int) called when request is queued.
         Other args: Generation parameters.
 
     Returns:
@@ -138,7 +217,7 @@ def generate_stencil_stream(
     """
     body, headers = _build_multipart(zip_path, thickness, shrink, pcb_thickness,
                                      shoulder_length, shoulder_width, enable_shoulders,
-                                     shoulder_clearance, nozzle_diameter)
+                                     shoulder_clearance, nozzle_diameter, enable_slotify)
 
     req = Request(STREAM_URL, data=body, headers=headers, method="POST")
     ctx = _ssl_context()
@@ -165,6 +244,14 @@ def generate_stencil_stream(
                             data.get("step", 0),
                             data.get("total", 5),
                             data.get("label", ""),
+                            data.get("labelText", ""),
+                            data.get("faceProgress", []),
+                        )
+                    elif event_type == "queued" and on_queued:
+                        on_queued(
+                            data.get("position", 1),
+                            data.get("queueDepth", 1),
+                            data.get("etaSeconds", 0),
                         )
                     elif event_type == "complete":
                         stl_path = data.get("stlPath", "")
