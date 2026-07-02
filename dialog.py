@@ -4,7 +4,9 @@ Author: Thomas COTTARD - https://www.stenchill.com
 """
 
 import json
+import math
 import os
+import shutil
 import subprocess
 import sys
 import threading
@@ -14,6 +16,15 @@ from datetime import datetime
 import wx
 import wx.adv
 import pcbnew
+
+
+def _add_logo(panel, sizer, top_margin: int) -> None:
+    """Add the 48x48 Stenchill logo to the sizer, if the icon file exists."""
+    logo_path = os.path.join(os.path.dirname(__file__), "icon-96.png")
+    if not os.path.exists(logo_path):
+        return
+    img = wx.Image(logo_path, wx.BITMAP_TYPE_PNG).Scale(48, 48, wx.IMAGE_QUALITY_BICUBIC)
+    sizer.Add(wx.StaticBitmap(panel, bitmap=wx.Bitmap(img)), 0, wx.TOP | wx.ALIGN_CENTER, top_margin)
 
 
 def _open_in_file_manager(path: str) -> None:
@@ -48,40 +59,49 @@ _SETTINGS_DIR = os.path.join(os.path.expanduser("~"), ".config", "stenchill")
 _SETTINGS_FILE = os.path.join(_SETTINGS_DIR, "settings.json")
 
 
-def _load_settings() -> dict:
-    """Load saved parameters, falling back to defaults."""
-    try:
-        with open(_SETTINGS_FILE, "r") as f:
-            saved = json.load(f)
-            return {k: saved.get(k, v) for k, v in _DEFAULTS.items()}
-    except (FileNotFoundError, json.JSONDecodeError):
-        return dict(_DEFAULTS)
-
-
-def _save_settings(params: dict) -> None:
-    """Persist parameters for next session."""
-    try:
-        os.makedirs(_SETTINGS_DIR, exist_ok=True)
-        with open(_SETTINGS_FILE, "w") as f:
-            json.dump(params, f, indent=2)
-    except OSError:
-        pass
-
-
-def _reset_saved_params() -> None:
-    """Reset only the generation-parameter keys in the persisted settings back to
-    their defaults, preserving any other keys (e.g. a future export path). Never
-    deletes the file wholesale, so nothing outside _DEFAULTS is ever touched."""
-    data = {}
+def _read_raw_settings() -> dict:
+    """Best-effort raw read of the settings file; {} on any problem."""
     try:
         with open(_SETTINGS_FILE, "r") as f:
             data = json.load(f)
-    except (FileNotFoundError, json.JSONDecodeError):
-        data = {}
-    if not isinstance(data, dict):
-        data = {}
-    data.update(_DEFAULTS)
-    _save_settings(data)
+    except Exception:
+        return {}
+    return data if isinstance(data, dict) else {}
+
+
+def _load_settings() -> dict:
+    """Load saved parameters, falling back to defaults. Never raises and never
+    returns an ill-typed value: a corrupt or unreadable settings file must not
+    prevent the dialog from opening (the values feed SpinCtrlDouble.SetValue)."""
+    saved = _read_raw_settings()
+    settings = {}
+    for key, default in _DEFAULTS.items():
+        value = saved.get(key, default)
+        if isinstance(default, bool):
+            settings[key] = value if isinstance(value, bool) else default
+        else:
+            try:
+                value = float(value)
+            except (TypeError, ValueError):
+                value = default
+            # json.load accepts bare NaN/Infinity tokens; those would reach
+            # SpinCtrlDouble.SetValue unclamped and leak "nan" to the API.
+            settings[key] = value if math.isfinite(value) else default
+    return settings
+
+
+def _save_settings(params: dict) -> None:
+    """Persist parameters for next session. Read-merge-write, so keys other
+    than the generation parameters (e.g. a future export path) survive both
+    Generate and Reset."""
+    try:
+        data = _read_raw_settings()
+        data.update(params)
+        os.makedirs(_SETTINGS_DIR, exist_ok=True)
+        with open(_SETTINGS_FILE, "w") as f:
+            json.dump(data, f, indent=2)
+    except OSError:
+        pass
 
 
 class _ConfirmDialog(wx.Dialog):
@@ -93,10 +113,7 @@ class _ConfirmDialog(wx.Dialog):
         panel = wx.Panel(self)
         sizer = wx.BoxSizer(wx.VERTICAL)
 
-        logo_path = os.path.join(os.path.dirname(__file__), "icon-96.png")
-        if os.path.exists(logo_path):
-            img = wx.Image(logo_path, wx.BITMAP_TYPE_PNG).Scale(48, 48, wx.IMAGE_QUALITY_BICUBIC)
-            sizer.Add(wx.StaticBitmap(panel, bitmap=wx.Bitmap(img)), 0, wx.TOP | wx.ALIGN_CENTER, 16)
+        _add_logo(panel, sizer, 16)
 
         heading = wx.StaticText(panel, label=title)
         heading_font = heading.GetFont()
@@ -142,6 +159,7 @@ class StenchillDialog(wx.Dialog):
         # wx.CallAfter callbacks so they don't rewrite the UI.
         self._generating = False
         self._gen_token = 0
+        self._cancel_event = None
         self._last_gen_dir = None
         self._settings = _load_settings()
         self._build_ui()
@@ -156,12 +174,7 @@ class StenchillDialog(wx.Dialog):
         main_sizer = wx.BoxSizer(wx.VERTICAL)
 
         # ── Logo ──
-        logo_path = os.path.join(os.path.dirname(__file__), "icon-96.png")
-        if os.path.exists(logo_path):
-            logo_img = wx.Image(logo_path, wx.BITMAP_TYPE_PNG)
-            logo_img = logo_img.Scale(48, 48, wx.IMAGE_QUALITY_BICUBIC)
-            logo_bmp = wx.StaticBitmap(panel, bitmap=wx.Bitmap(logo_img))
-            main_sizer.Add(logo_bmp, 0, wx.TOP | wx.ALIGN_CENTER, 10)
+        _add_logo(panel, main_sizer, 10)
 
         # ── Header ──
         header = wx.StaticText(panel, label="Generate 3D-Printable Stencil")
@@ -257,6 +270,21 @@ class StenchillDialog(wx.Dialog):
 
         shoulder_box.Add(self.shoulder_grid, 0, wx.EXPAND | wx.LEFT | wx.RIGHT | wx.BOTTOM, 8)
         main_sizer.Add(shoulder_box, 0, wx.EXPAND | wx.LEFT | wx.RIGHT, 10)
+
+        # Single key -> control registry. _on_generate (collect) and _on_reset
+        # (restore defaults) iterate this instead of maintaining parallel
+        # hand-written lists that silently drift when a parameter is added.
+        self._param_ctrls = {
+            "thickness": self.thickness_ctrl,
+            "shrink": self.shrink_ctrl,
+            "nozzle_diameter": self.nozzle_ctrl,
+            "enable_slotify": self.slotify_cb,
+            "enable_shoulders": self.shoulders_cb,
+            "pcb_thickness": self.pcb_thickness_ctrl,
+            "shoulder_length": self.shoulder_length_ctrl,
+            "shoulder_width": self.shoulder_width_ctrl,
+            "shoulder_clearance": self.shoulder_clearance_ctrl,
+        }
 
         # ── Output directory ──
         dir_sizer = wx.BoxSizer(wx.HORIZONTAL)
@@ -403,24 +431,30 @@ class StenchillDialog(wx.Dialog):
         self.progress.SetRange(100)
         self.progress.SetValue(0)
         self.panel.Layout()
+        # Flush the repaint now: the Gerber export below blocks the UI thread
+        # (pcbnew.BOARD is main-thread-only), so without this the busy state
+        # would never be painted and KiCad would look hung.
+        self.panel.Refresh()
+        self.panel.Update()
 
-        # Collect parameters
-        params = {
-            "thickness": self.thickness_ctrl.GetValue(),
-            "shrink": self.shrink_ctrl.GetValue(),
-            "nozzle_diameter": self.nozzle_ctrl.GetValue(),
-            "enable_slotify": self.slotify_cb.GetValue(),
-            "enable_shoulders": self.shoulders_cb.GetValue(),
-            "pcb_thickness": self.pcb_thickness_ctrl.GetValue(),
-            "shoulder_length": self.shoulder_length_ctrl.GetValue(),
-            "shoulder_width": self.shoulder_width_ctrl.GetValue(),
-            "shoulder_clearance": self.shoulder_clearance_ctrl.GetValue(),
-        }
+        params = {key: ctrl.GetValue() for key, ctrl in self._param_ctrls.items()}
         output_dir = self.output_dir.GetPath()
         board_name = os.path.splitext(os.path.basename(self.board.GetFileName()))[0]
 
         # Save params for next session
         _save_settings(params)
+
+        # Lets the worker abort the SSE stream promptly instead of consuming
+        # the connection to completion after a cancel.
+        self._cancel_event = threading.Event()
+
+        # Defer the blocking export one event-loop iteration so any pending
+        # paint events run first.
+        wx.CallAfter(self._start_generation, params, output_dir, board_name, self._gen_token)
+
+    def _start_generation(self, params, output_dir, board_name, token):
+        if token != self._gen_token:
+            return  # cancelled before the export even started
 
         # Export Gerbers on main thread (pcbnew.BOARD is not thread-safe)
         try:
@@ -432,18 +466,20 @@ class StenchillDialog(wx.Dialog):
 
         thread = threading.Thread(
             target=self._generate_worker,
-            args=(zip_path, params, output_dir, board_name, self._gen_token),
+            args=(zip_path, params, output_dir, board_name, token, self._cancel_event),
             daemon=True,
         )
         thread.start()
 
-    def _generate_worker(self, zip_path, params, output_dir, board_name, token):
+    def _generate_worker(self, zip_path, params, output_dir, board_name, token, cancel_event):
         """Background worker: call API with SSE streaming, save results.
 
         ``token`` is the generation id captured at launch. Every UI update goes
         through ``ui()``, which drops the update if the user has cancelled or
         started another generation (token no longer current) — so a cancelled
         run can never rewrite the form or a freshly destroyed dialog.
+        ``cancel_event`` is set on cancel so the SSE stream aborts promptly
+        instead of running to completion just to be discarded.
         """
         def ui(fn, *fargs):
             def _apply():
@@ -452,12 +488,15 @@ class StenchillDialog(wx.Dialog):
             wx.CallAfter(_apply)
 
         result_zip = None
-        from .api_client import generate_stencil_stream, compose_progress_label
+        from .api_client import (
+            generate_stencil_stream, compose_progress_label, GenerationCancelled,
+        )
         try:
             ui(self._set_status, "Connecting to Stenchill...")
 
             def on_progress(step, total, label, label_text, face_progress):
                 percent = int((step / total) * 100) if total > 0 else 0
+                percent = max(0, min(100, percent))  # gauge range is fixed at 100
                 text = compose_progress_label(label, label_text, face_progress)
                 ui(self._set_progress, percent, text)
 
@@ -471,6 +510,7 @@ class StenchillDialog(wx.Dialog):
                     zip_path=zip_path,
                     on_progress=on_progress,
                     on_queued=on_queued,
+                    cancel_event=cancel_event,
                     thickness=params["thickness"],
                     shrink=params["shrink"],
                     pcb_thickness=params["pcb_thickness"],
@@ -515,6 +555,12 @@ class StenchillDialog(wx.Dialog):
                     if is_mesh:
                         saved_files.append(safe_name)
 
+            # Cancelled while the files were being written: remove the partial
+            # output so no orphan folder silently appears in the project dir.
+            if token != self._gen_token:
+                shutil.rmtree(gen_dir, ignore_errors=True)
+                return
+
             if saved_files:
                 files_str = ", ".join(saved_files)
                 folder_name = os.path.basename(gen_dir)
@@ -522,6 +568,8 @@ class StenchillDialog(wx.Dialog):
             else:
                 ui(self._on_error, "No STL files found in the API response.")
 
+        except GenerationCancelled:
+            pass  # user cancelled; the finally below cleans up the temp ZIP
         except Exception as e:
             ui(self._on_error, str(e))
         finally:
@@ -537,32 +585,30 @@ class StenchillDialog(wx.Dialog):
         if label:
             self.status_text.SetLabel(label)
 
-    def _on_success(self, message, gen_dir):
+    def _set_idle(self, show_result=False, show_open_folder=False):
+        """Return the dialog to its idle state. Single owner of the busy/idle
+        widget toggles: success, error and cancel all funnel through here, so
+        a new widget in the status area only needs wiring in one place."""
         self._generating = False
-        self._last_gen_dir = gen_dir
         self.dismiss_btn.SetLabel("Quit")
         self.main_sizer.Show(self.progress, False)
         self.main_sizer.Show(self.status_text, False)
-        self.main_sizer.Show(self.result_text, True)
-        self.main_sizer.Show(self.open_folder_btn, True)
+        self.main_sizer.Show(self.result_text, show_result)
+        self.main_sizer.Show(self.open_folder_btn, show_open_folder)
         self.generate_btn.Enable()
         self.reset_btn.Enable()
-        self.result_text.SetForegroundColour(wx.Colour(0, 128, 0))
-        self.result_text.SetLabel(f"\u2705  {message}")
         self.panel.Layout()
 
+    def _on_success(self, message, gen_dir):
+        self._last_gen_dir = gen_dir
+        self.result_text.SetForegroundColour(wx.Colour(0, 128, 0))
+        self.result_text.SetLabel(f"\u2705  {message}")
+        self._set_idle(show_result=True, show_open_folder=True)
+
     def _on_error(self, message):
-        self._generating = False
-        self.dismiss_btn.SetLabel("Quit")
-        self.main_sizer.Show(self.progress, False)
-        self.main_sizer.Show(self.status_text, False)
-        self.main_sizer.Show(self.result_text, True)
-        self.main_sizer.Show(self.open_folder_btn, False)
-        self.generate_btn.Enable()
-        self.reset_btn.Enable()
         self.result_text.SetForegroundColour(wx.Colour(200, 0, 0))
         self.result_text.SetLabel(f"\u274c  Error: {message}")
-        self.panel.Layout()
+        self._set_idle(show_result=True)
 
     def _on_dismiss(self, event):
         """Bottom button: cancel the running generation, or close the dialog."""
@@ -573,18 +619,13 @@ class StenchillDialog(wx.Dialog):
 
     def _cancel_generation(self):
         """Abandon the UI wait and return to the idle form. Invalidates the
-        running worker's callbacks (via _gen_token); the background request may
-        still finish server-side, but its result is ignored."""
+        running worker's callbacks (via _gen_token) and signals the worker to
+        abort the SSE stream (via the cancel event) instead of consuming the
+        connection to completion."""
         self._gen_token += 1
-        self._generating = False
-        self.dismiss_btn.SetLabel("Quit")
-        self.generate_btn.Enable()
-        self.reset_btn.Enable()
-        self.main_sizer.Show(self.progress, False)
-        self.main_sizer.Show(self.status_text, False)
-        self.main_sizer.Show(self.result_text, False)
-        self.main_sizer.Show(self.open_folder_btn, False)
-        self.panel.Layout()
+        if self._cancel_event is not None:
+            self._cancel_event.set()
+        self._set_idle()
 
     def _on_open_folder(self, event):
         """Open the last generation's output folder in the OS file manager."""
@@ -597,23 +638,18 @@ class StenchillDialog(wx.Dialog):
         if not _confirm(self, "Reset params",
                         "Reset all parameters to their default values?"):
             return
-        self.thickness_ctrl.SetValue(_DEFAULTS["thickness"])
-        self.shrink_ctrl.SetValue(_DEFAULTS["shrink"])
-        self.nozzle_ctrl.SetValue(_DEFAULTS["nozzle_diameter"])
-        self.slotify_cb.SetValue(_DEFAULTS["enable_slotify"])
-        self.shoulders_cb.SetValue(_DEFAULTS["enable_shoulders"])
-        self.pcb_thickness_ctrl.SetValue(_DEFAULTS["pcb_thickness"])
-        self.shoulder_length_ctrl.SetValue(_DEFAULTS["shoulder_length"])
-        self.shoulder_width_ctrl.SetValue(_DEFAULTS["shoulder_width"])
-        self.shoulder_clearance_ctrl.SetValue(_DEFAULTS["shoulder_clearance"])
+        for key, ctrl in self._param_ctrls.items():
+            ctrl.SetValue(_DEFAULTS[key])
         self._on_shoulder_toggle(None)
         self._settings = dict(_DEFAULTS)
-        _reset_saved_params()
+        _save_settings(dict(_DEFAULTS))
 
     def _on_close(self, event):
         """Window [X] / Escape: invalidate any in-flight worker callbacks, then
         close ONLY this dialog (never the parent PCB view)."""
         self._gen_token += 1
+        if self._cancel_event is not None:
+            self._cancel_event.set()
         self._generating = False
         self._close_dialog()
 

@@ -20,7 +20,20 @@ from urllib.error import HTTPError, URLError
 # Only stdlib used - no external dependencies required.
 
 
+_ssl_ctx_cache = None
+
+
 def _ssl_context() -> ssl.SSLContext:
+    """Return the shared SSL context, building it on first use. The resolution
+    (certifi import, cert-path probing, CA-bundle parse) never changes within a
+    session, so it runs once instead of on every request."""
+    global _ssl_ctx_cache
+    if _ssl_ctx_cache is None:
+        _ssl_ctx_cache = _build_ssl_context()
+    return _ssl_ctx_cache
+
+
+def _build_ssl_context() -> ssl.SSLContext:
     """Build an SSL context with broad OS compatibility.
 
     Resolution order:
@@ -145,6 +158,56 @@ class ApiError(Exception):
         self.status_code = status_code
 
 
+class GenerationCancelled(Exception):
+    """Raised inside generate_stencil_stream when the caller's cancel_event is
+    set: the stream is abandoned and the result is never downloaded."""
+
+
+def _as_int(value, default=0):
+    """Coerce an SSE payload field to int, tolerating null/strings/garbage.
+    The server contract says int, but a proxy or server change must degrade to
+    the default rather than kill the generation with a TypeError."""
+    try:
+        if isinstance(value, bool):
+            return default
+        return int(value)
+    except (TypeError, ValueError):
+        return default
+
+
+def _dispatch_sse_event(event_type, data_str, on_progress, on_queued):
+    """Handle one complete SSE event. Returns the stlPath for a 'complete'
+    event, None otherwise. Raises ApiError for an 'error' event. Malformed
+    payloads are skipped silently (the stream must survive them)."""
+    try:
+        data = json.loads(data_str)
+    except (json.JSONDecodeError, ValueError):
+        return None
+    if not isinstance(data, dict):
+        return None
+
+    if event_type == "progress" and on_progress:
+        face_progress = data.get("faceProgress")
+        on_progress(
+            _as_int(data.get("step"), 0),
+            _as_int(data.get("total"), 5),
+            str(data.get("label") or ""),
+            str(data.get("labelText") or ""),
+            face_progress if isinstance(face_progress, list) else [],
+        )
+    elif event_type == "queued" and on_queued:
+        on_queued(
+            _as_int(data.get("position"), 1),
+            _as_int(data.get("queueDepth"), 1),
+            _as_int(data.get("etaSeconds"), 0),
+        )
+    elif event_type == "complete":
+        return data.get("stlPath", "")
+    elif event_type == "error":
+        raise ApiError(f"Generation failed: {data.get('error', 'unknown')}")
+    return None
+
+
 def _build_multipart(zip_path, thickness, shrink, pcb_thickness, shoulder_length,
                      shoulder_width, enable_shoulders, shoulder_clearance, nozzle_diameter,
                      enable_slotify):
@@ -193,6 +256,7 @@ def generate_stencil_stream(
     zip_path: str,
     on_progress=None,
     on_queued=None,
+    cancel_event=None,
     thickness: float = 0.4,
     shrink: float = 0.0,
     pcb_thickness: float = 1.6,
@@ -204,16 +268,23 @@ def generate_stencil_stream(
     enable_slotify: bool = True,
 ) -> str:
     """
-    SSE streaming generation - calls on_progress(step, total, label, label_text) and returns path to result ZIP.
+    SSE streaming generation - returns path to the result ZIP.
 
     Args:
         zip_path: Path to the Gerber ZIP file.
-        on_progress: Callback(step: int, total: int, label: str, label_text: str) called for each progress event.
+        on_progress: Callback(step: int, total: int, label: str, label_text: str,
+            face_progress: list) called for each progress event.
         on_queued: Callback(position: int, queue_depth: int, eta_seconds: int) called when request is queued.
+        cancel_event: Optional threading.Event; when set, the stream is
+            abandoned (GenerationCancelled) and the result is never downloaded.
         Other args: Generation parameters.
 
     Returns:
         Path to the downloaded result ZIP containing STL files.
+
+    Raises:
+        GenerationCancelled: cancel_event was set during the stream.
+        ApiError: server or network error.
     """
     body, headers = _build_multipart(zip_path, thickness, shrink, pcb_thickness,
                                      shoulder_length, shoulder_width, enable_shoulders,
@@ -225,42 +296,44 @@ def generate_stencil_stream(
     try:
         with urlopen(req, timeout=TIMEOUT_SECONDS, context=ctx) as resp:
             stl_path = None
+            # Spec-conformant SSE assembly: data lines accumulate until a blank
+            # line ends the event (multi-line data is joined with "\n"),
+            # comment lines (": ping" keep-alives) and unknown fields (id:,
+            # retry:) are ignored.
             event_type = None
+            data_lines = []
 
             for raw_line in resp:
-                line = raw_line.decode("utf-8").rstrip("\n\r")
+                if cancel_event is not None and cancel_event.is_set():
+                    raise GenerationCancelled()
+                line = raw_line.decode("utf-8", errors="replace").rstrip("\n\r")
 
-                if line.startswith("event:"):
+                if not line:
+                    if data_lines:
+                        result = _dispatch_sse_event(
+                            event_type, "\n".join(data_lines), on_progress, on_queued
+                        )
+                        if result is not None:
+                            stl_path = result
+                    event_type = None
+                    data_lines = []
+                elif line.startswith(":"):
+                    pass  # comment / keep-alive
+                elif line.startswith("event:"):
                     event_type = line[6:].strip()
                 elif line.startswith("data:"):
-                    data_str = line[5:].strip()
-                    try:
-                        data = json.loads(data_str)
-                    except (json.JSONDecodeError, ValueError):
-                        continue
+                    data_lines.append(line[5:].lstrip(" "))
 
-                    if event_type == "progress" and on_progress:
-                        on_progress(
-                            data.get("step", 0),
-                            data.get("total", 5),
-                            data.get("label", ""),
-                            data.get("labelText", ""),
-                            data.get("faceProgress", []),
-                        )
-                    elif event_type == "queued" and on_queued:
-                        on_queued(
-                            data.get("position", 1),
-                            data.get("queueDepth", 1),
-                            data.get("etaSeconds", 0),
-                        )
-                    elif event_type == "complete":
-                        stl_path = data.get("stlPath", "")
-                    elif event_type == "error":
-                        raise ApiError(
-                            f"Generation failed: {data.get('error', 'unknown')}",
-                        )
+            # Dispatch a final event not terminated by a blank line.
+            if data_lines:
+                result = _dispatch_sse_event(
+                    event_type, "\n".join(data_lines), on_progress, on_queued
+                )
+                if result is not None:
+                    stl_path = result
 
-                    event_type = None
+            if cancel_event is not None and cancel_event.is_set():
+                raise GenerationCancelled()
 
             if not stl_path:
                 raise ApiError("No result received from server")
@@ -273,10 +346,17 @@ def generate_stencil_stream(
             download_url = f"{API_BASE}/download/{stl_path}"
             dl_req = Request(download_url, headers={"User-Agent": _get_user_agent(), "X-API-Key": API_KEY})
             with urlopen(dl_req, timeout=TIMEOUT_SECONDS, context=ctx) as dl_resp:
-                result_data = dl_resp.read()
                 tmp = tempfile.NamedTemporaryFile(suffix=".zip", prefix="stenchill_result_", delete=False)
                 try:
-                    tmp.write(result_data)
+                    # Stream in chunks: constant memory for multi-MB results,
+                    # and cancellation is honoured mid-download.
+                    while True:
+                        if cancel_event is not None and cancel_event.is_set():
+                            raise GenerationCancelled()
+                        chunk = dl_resp.read(64 * 1024)
+                        if not chunk:
+                            break
+                        tmp.write(chunk)
                     tmp.close()
                     return tmp.name
                 except Exception:
