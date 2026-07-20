@@ -72,6 +72,7 @@ API_BASE = os.environ.get(
     "STENCHILL_API_BASE", "https://www.stenchill.com/api/v1"
 ).rstrip("/")
 STREAM_URL = f"{API_BASE}/generate/stream"
+SHARE_URL = f"{API_BASE}/plugin/share"
 # Client identification key (not a secret - used for rate limiting and source tracking)
 API_KEY = "stenchill-kicad-2026-xK9mP4wQ7rT2"
 TIMEOUT_SECONDS = 300
@@ -250,6 +251,58 @@ def _build_multipart(zip_path, thickness, shrink, pcb_thickness, shoulder_length
         "X-API-Key": API_KEY,
     }
     return body, headers
+
+
+def _build_file_multipart(zip_path: str):
+    """Multipart body + headers carrying only the gerber ZIP under field 'file'.
+
+    The share endpoint needs the file alone (no generation params), so this is a
+    trimmed sibling of ``_build_multipart``.
+    """
+    boundary = f"----StenchillBoundary{uuid.uuid4().hex}"
+
+    with open(zip_path, "rb") as f:
+        file_data = f.read()
+
+    file_part = (
+        f'--{boundary}\r\n'
+        f'Content-Disposition: form-data; name="file"; filename="gerbers.zip"\r\n'
+        f'Content-Type: application/zip\r\n\r\n'
+    )
+
+    body = file_part.encode("utf-8") + file_data + f"\r\n--{boundary}--\r\n".encode("utf-8")
+    headers = {
+        "Content-Type": f"multipart/form-data; boundary={boundary}",
+        "User-Agent": _get_user_agent(),
+        "X-API-Key": API_KEY,
+    }
+    return body, headers
+
+
+def share_stencil(zip_path: str, params: dict | None = None) -> str:
+    """Upload the gerber ZIP to the share endpoint and return the /view URL.
+
+    When ``params`` (the snake_case dialog dict) is provided, a
+    stenchill-params.json is embedded in the ZIP so /view reproduces the
+    plugin's exact stencil. Raises ApiError on any HTTP/network failure.
+    """
+    if params is not None:
+        from .share_params import inject_params_into_zip
+        inject_params_into_zip(zip_path, params)
+    body, headers = _build_file_multipart(zip_path)
+    req = Request(SHARE_URL, data=body, headers=headers, method="POST")
+    try:
+        with urlopen(req, context=_ssl_context(), timeout=TIMEOUT_SECONDS) as resp:
+            payload = json.loads(resp.read().decode("utf-8"))
+        url = payload.get("url")
+        if not url:
+            raise ApiError("Share response did not include a URL.")
+        return url
+    except HTTPError as e:
+        detail = e.read().decode("utf-8", "replace") if e.fp else ""
+        raise ApiError(f"Share failed (HTTP {e.code}): {detail}", status_code=e.code)
+    except URLError as e:
+        raise ApiError(f"Could not reach the server: {e.reason}")
 
 
 def generate_stencil_stream(

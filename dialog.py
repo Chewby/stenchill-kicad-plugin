@@ -10,6 +10,7 @@ import shutil
 import subprocess
 import sys
 import threading
+import webbrowser
 import zipfile
 from datetime import datetime
 
@@ -315,13 +316,23 @@ class StenchillDialog(wx.Dialog):
         self.open_folder_btn = wx.Button(panel, wx.ID_ANY, "\U0001F4C1  Open folder")
         self.open_folder_btn.SetToolTip("Open the output folder in your file manager")
         self.open_folder_btn.Bind(wx.EVT_BUTTON, self._on_open_folder)
-        main_sizer.Add(self.open_folder_btn, 0, wx.LEFT | wx.RIGHT | wx.TOP, 10)
+
+        self.view_3d_btn = wx.Button(panel, wx.ID_ANY, "\U0001F310  View in 3D")
+        self.view_3d_btn.SetToolTip("Upload the gerbers and open an interactive 3D preview on stenchill.com")
+        self.view_3d_btn.Bind(wx.EVT_BUTTON, self._on_view_3d)
+
+        # Post-generation actions on one row: review first (View in 3D), then
+        # grab the files (Open folder). Shown/hidden together via this sizer.
+        self.result_btn_sizer = wx.BoxSizer(wx.HORIZONTAL)
+        self.result_btn_sizer.Add(self.view_3d_btn, 0, wx.RIGHT, 8)
+        self.result_btn_sizer.Add(self.open_folder_btn, 0)
+        main_sizer.Add(self.result_btn_sizer, 0, wx.LEFT | wx.RIGHT | wx.TOP, 10)
 
         # Initially hide all status widgets
         main_sizer.Show(self.progress, False)
         main_sizer.Show(self.status_text, False)
         main_sizer.Show(self.result_text, False)
-        main_sizer.Show(self.open_folder_btn, False)
+        main_sizer.Show(self.result_btn_sizer, False)
 
         # ── Spacer to push buttons to bottom ──
         main_sizer.AddStretchSpacer()
@@ -425,7 +436,7 @@ class StenchillDialog(wx.Dialog):
         self.main_sizer.Show(self.progress, True)
         self.main_sizer.Show(self.status_text, True)
         self.main_sizer.Show(self.result_text, False)
-        self.main_sizer.Show(self.open_folder_btn, False)
+        self.main_sizer.Show(self.result_btn_sizer, False)
         self.status_text.SetForegroundColour(wx.Colour(100, 100, 100))
         self.status_text.SetLabel("Exporting Gerber layers...")
         self.progress.SetRange(100)
@@ -594,7 +605,7 @@ class StenchillDialog(wx.Dialog):
         self.main_sizer.Show(self.progress, False)
         self.main_sizer.Show(self.status_text, False)
         self.main_sizer.Show(self.result_text, show_result)
-        self.main_sizer.Show(self.open_folder_btn, show_open_folder)
+        self.main_sizer.Show(self.result_btn_sizer, show_open_folder)
         self.generate_btn.Enable()
         self.reset_btn.Enable()
         self.panel.Layout()
@@ -626,6 +637,65 @@ class StenchillDialog(wx.Dialog):
         if self._cancel_event is not None:
             self._cancel_event.set()
         self._set_idle()
+
+    def _on_view_3d(self, event):
+        """Re-export the gerbers, upload them to the share endpoint, and open the
+        result on the website. The gerber ZIP is re-exported fresh because the
+        generation ZIP was already cleaned up. The current form params are
+        embedded (stenchill-params.json) so /view reproduces this exact stencil.
+
+        Feedback goes through ``result_text`` because ``status_text`` is hidden in
+        the post-success state (the result widget is the visible one)."""
+        self.view_3d_btn.Enable(False)
+        self.result_text.SetForegroundColour(wx.Colour(100, 100, 100))
+        self.result_text.SetLabel("Opening 3D view on stenchill.com...")
+        self.panel.Layout()
+
+        params = {key: ctrl.GetValue() for key, ctrl in self._param_ctrls.items()}
+
+        # Export Gerbers on the main thread (pcbnew.BOARD is not thread-safe).
+        try:
+            from .exporter import export_gerber_zip
+            zip_path = export_gerber_zip(self.board)
+        except Exception as exc:  # noqa: BLE001 - surface any failure to the user
+            self._on_view_3d_done(None, str(exc))
+            return
+
+        def worker():
+            try:
+                from .api_client import share_stencil
+                url = share_stencil(zip_path, params)
+                wx.CallAfter(self._on_view_3d_done, url, None)
+            except Exception as exc:  # noqa: BLE001 - surface any failure to the user
+                wx.CallAfter(self._on_view_3d_done, None, str(exc))
+            finally:
+                if zip_path and os.path.exists(zip_path):
+                    try:
+                        os.remove(zip_path)
+                    except OSError:
+                        pass
+
+        threading.Thread(target=worker, daemon=True).start()
+
+    def _on_view_3d_done(self, url, error):
+        """Back on the UI thread: open the browser or show the error."""
+        self.view_3d_btn.Enable(True)
+        if error:
+            self.result_text.SetForegroundColour(wx.Colour(200, 0, 0))
+            self.result_text.SetLabel(f"❌  Could not open 3D view: {error}")
+            self.panel.Layout()
+            return
+        try:
+            opened = webbrowser.open(url)
+        except Exception:  # noqa: BLE001
+            opened = False
+        if opened:
+            self.result_text.SetForegroundColour(wx.Colour(0, 128, 0))
+            self.result_text.SetLabel("✅  Opened 3D view in your browser.")
+        else:
+            self.result_text.SetForegroundColour(wx.Colour(100, 100, 100))
+            self.result_text.SetLabel(f"\U0001F517  Open this link in your browser:\n{url}")
+        self.panel.Layout()
 
     def _on_open_folder(self, event):
         """Open the last generation's output folder in the OS file manager."""
