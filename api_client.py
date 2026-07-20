@@ -110,7 +110,7 @@ def is_newer(latest, current) -> bool:
     return lv > cv
 
 
-def compose_progress_label(label, label_text, face_progress):
+def compose_progress_label(label_text, face_progress):
     """Build the displayed progress text, mirroring the website's per-face
     composition (`composeFaceProgressLabel`).
 
@@ -179,7 +179,11 @@ def _as_int(value, default=0):
 def _dispatch_sse_event(event_type, data_str, on_progress, on_queued):
     """Handle one complete SSE event. Returns the stlPath for a 'complete'
     event, None otherwise. Raises ApiError for an 'error' event. Malformed
-    payloads are skipped silently (the stream must survive them)."""
+    payloads are skipped silently (the stream must survive them).
+
+    Per the SSE spec, an event with no ``event:`` field has type "message"."""
+    if event_type is None:
+        event_type = "message"
     try:
         data = json.loads(data_str)
     except (json.JSONDecodeError, ValueError):
@@ -284,7 +288,9 @@ def share_stencil(zip_path: str, params: dict | None = None) -> str:
 
     When ``params`` (the snake_case dialog dict) is provided, a
     stenchill-params.json is embedded in the ZIP so /view reproduces the
-    plugin's exact stencil. Raises ApiError on any HTTP/network failure.
+    plugin's exact stencil. NOTE: this MUTATES the file at ``zip_path`` in
+    place (fine for the dialog's throwaway export, surprising otherwise).
+    Raises ApiError on any HTTP/network failure.
     """
     if params is not None:
         from .share_params import inject_params_into_zip

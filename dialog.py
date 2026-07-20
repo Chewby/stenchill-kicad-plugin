@@ -162,6 +162,10 @@ class StenchillDialog(wx.Dialog):
         self._gen_token = 0
         self._cancel_event = None
         self._last_gen_dir = None
+        # Params of the last successful generation: "View in 3D" shares these,
+        # not the live form values, so /view matches the STL files on disk even
+        # if the user tweaked the form after generating.
+        self._last_gen_params = None
         self._settings = _load_settings()
         self._build_ui()
         self.CenterOnParent()
@@ -508,7 +512,7 @@ class StenchillDialog(wx.Dialog):
             def on_progress(step, total, label, label_text, face_progress):
                 percent = int((step / total) * 100) if total > 0 else 0
                 percent = max(0, min(100, percent))  # gauge range is fixed at 100
-                text = compose_progress_label(label, label_text, face_progress)
+                text = compose_progress_label(label_text, face_progress)
                 ui(self._set_progress, percent, text)
 
             def on_queued(position, queue_depth, eta_seconds):
@@ -566,6 +570,16 @@ class StenchillDialog(wx.Dialog):
                     if is_mesh:
                         saved_files.append(safe_name)
 
+            # Record of the settings used, next to the STLs (same content the
+            # share flow embeds in the upload ZIP). Best-effort: nothing (bad
+            # disk, missing module in a mis-packaged install, ...) must fail a
+            # generation whose STLs are already saved.
+            try:
+                from .share_params import write_params_json
+                write_params_json(gen_dir, params)
+            except Exception:  # noqa: BLE001
+                pass
+
             # Cancelled while the files were being written: remove the partial
             # output so no orphan folder silently appears in the project dir.
             if token != self._gen_token:
@@ -575,7 +589,7 @@ class StenchillDialog(wx.Dialog):
             if saved_files:
                 files_str = ", ".join(saved_files)
                 folder_name = os.path.basename(gen_dir)
-                ui(self._on_success, f"Saved: {files_str}\nFolder: {folder_name}", gen_dir)
+                ui(self._on_success, f"Saved: {files_str}\nFolder: {folder_name}", gen_dir, params)
             else:
                 ui(self._on_error, "No STL files found in the API response.")
 
@@ -590,11 +604,15 @@ class StenchillDialog(wx.Dialog):
     def _set_status(self, text):
         self.status_text.SetLabel(text)
         self.progress.Pulse()
+        # Re-layout: the label length varies (queue position, composed
+        # per-face progress) and a stale layout can clip the text.
+        self.panel.Layout()
 
     def _set_progress(self, percent, label):
         self.progress.SetValue(percent)
         if label:
             self.status_text.SetLabel(label)
+            self.panel.Layout()
 
     def _set_idle(self, show_result=False, show_open_folder=False):
         """Return the dialog to its idle state. Single owner of the busy/idle
@@ -610,8 +628,9 @@ class StenchillDialog(wx.Dialog):
         self.reset_btn.Enable()
         self.panel.Layout()
 
-    def _on_success(self, message, gen_dir):
+    def _on_success(self, message, gen_dir, params):
         self._last_gen_dir = gen_dir
+        self._last_gen_params = params
         self.result_text.SetForegroundColour(wx.Colour(0, 128, 0))
         self.result_text.SetLabel(f"\u2705  {message}")
         self._set_idle(show_result=True, show_open_folder=True)
@@ -641,33 +660,55 @@ class StenchillDialog(wx.Dialog):
     def _on_view_3d(self, event):
         """Re-export the gerbers, upload them to the share endpoint, and open the
         result on the website. The gerber ZIP is re-exported fresh because the
-        generation ZIP was already cleaned up. The current form params are
-        embedded (stenchill-params.json) so /view reproduces this exact stencil.
+        generation ZIP was already cleaned up. The last generation's params are
+        embedded (stenchill-params.json) so /view reproduces the stencil that
+        was actually saved, even if the form was tweaked since.
 
         Feedback goes through ``result_text`` because ``status_text`` is hidden in
         the post-success state (the result widget is the visible one)."""
+        # Same lifecycle discipline as _on_generate: capture the current token
+        # so a close (which bumps it) invalidates the worker's late callbacks,
+        # and disable the other actions so two workers can't fight over the UI.
+        token = self._gen_token
         self.view_3d_btn.Enable(False)
+        self.generate_btn.Disable()
+        self.reset_btn.Disable()
         self.result_text.SetForegroundColour(wx.Colour(100, 100, 100))
         self.result_text.SetLabel("Opening 3D view on stenchill.com...")
         self.panel.Layout()
+        # Flush the repaint now: the Gerber export below blocks the UI thread
+        # (pcbnew.BOARD is main-thread-only), so without this the busy label
+        # would never be painted and KiCad would look hung.
+        self.panel.Refresh()
+        self.panel.Update()
 
-        params = {key: ctrl.GetValue() for key, ctrl in self._param_ctrls.items()}
+        params = self._last_gen_params or {
+            key: ctrl.GetValue() for key, ctrl in self._param_ctrls.items()
+        }
+
+        # Defer the blocking export one event-loop iteration so any pending
+        # paint events run first.
+        wx.CallAfter(self._start_share, params, token)
+
+    def _start_share(self, params, token):
+        if token != self._gen_token:
+            return  # dialog closed before the export even started
 
         # Export Gerbers on the main thread (pcbnew.BOARD is not thread-safe).
         try:
             from .exporter import export_gerber_zip
             zip_path = export_gerber_zip(self.board)
         except Exception as exc:  # noqa: BLE001 - surface any failure to the user
-            self._on_view_3d_done(None, str(exc))
+            self._on_view_3d_done(None, str(exc), token)
             return
 
         def worker():
             try:
                 from .api_client import share_stencil
                 url = share_stencil(zip_path, params)
-                wx.CallAfter(self._on_view_3d_done, url, None)
+                wx.CallAfter(self._on_view_3d_done, url, None, token)
             except Exception as exc:  # noqa: BLE001 - surface any failure to the user
-                wx.CallAfter(self._on_view_3d_done, None, str(exc))
+                wx.CallAfter(self._on_view_3d_done, None, str(exc), token)
             finally:
                 if zip_path and os.path.exists(zip_path):
                     try:
@@ -677,9 +718,13 @@ class StenchillDialog(wx.Dialog):
 
         threading.Thread(target=worker, daemon=True).start()
 
-    def _on_view_3d_done(self, url, error):
+    def _on_view_3d_done(self, url, error, token):
         """Back on the UI thread: open the browser or show the error."""
+        if token != self._gen_token:
+            return  # dialog closed while the share upload was in flight
         self.view_3d_btn.Enable(True)
+        self.generate_btn.Enable()
+        self.reset_btn.Enable()
         if error:
             self.result_text.SetForegroundColour(wx.Colour(200, 0, 0))
             self.result_text.SetLabel(f"❌  Could not open 3D view: {error}")

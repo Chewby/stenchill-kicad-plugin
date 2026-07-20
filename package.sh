@@ -33,13 +33,10 @@ PLUGIN_FILES=(
     "dialog.py"
     "exporter.py"
     "plugin.py"
+    "share_params.py"
 )
 
 # --- Version ---
-if [ ! -f metadata.json ]; then
-    echo "ERROR: metadata.json not found in $SCRIPT_DIR"
-    exit 1
-fi
 if [ -n "${1:-}" ]; then
     VERSION="$1"
 else
@@ -48,8 +45,6 @@ fi
 
 ZIP_NAME="stenchill-kicad-plugin-${VERSION}.zip"
 BUILD_DIR=$(mktemp -d)
-# Clean the temp tree on ANY exit (set -e aborts, Pillow missing, etc.)
-trap 'rm -rf "$BUILD_DIR"' EXIT
 
 echo "=== Stenchill KiCad Plugin Packager ==="
 echo "Version:    $VERSION"
@@ -59,6 +54,7 @@ echo ""
 # --- Verify source icon ---
 if [ ! -f "$ICON_SOURCE" ]; then
     echo "ERROR: Icon not found: $ICON_SOURCE"
+    rm -rf "$BUILD_DIR"
     exit 1
 fi
 
@@ -70,6 +66,7 @@ mkdir -p "$BUILD_DIR/resources"
 for f in "${PLUGIN_FILES[@]}"; do
     if [ ! -f "$f" ]; then
         echo "ERROR: Missing plugin file: $f"
+        rm -rf "$BUILD_DIR"
         exit 1
     fi
     cp "$f" "$BUILD_DIR/plugins/"
@@ -106,9 +103,12 @@ ZIP_TMP="$BUILD_DIR/$ZIP_NAME"
     plugins/ \
 )
 
-# Move ZIP to script dir (BUILD_DIR itself is removed by the EXIT trap)
+# Move ZIP to script dir
 cp "$ZIP_TMP" "$SCRIPT_DIR/$ZIP_NAME"
 ZIP_PATH="$SCRIPT_DIR/$ZIP_NAME"
+
+# Cleanup
+rm -rf "$BUILD_DIR"
 
 # --- Compute stats ---
 SHA256=$(shasum -a 256 "$ZIP_PATH" | awk '{print $1}')
@@ -167,10 +167,14 @@ with open('$METADATA_REPO_FILE', 'w') as f:
 
 print('  done')
 "
-    # Copy the already-generated 64x64 icon to the metadata repo, so both
-    # destinations always ship the exact same image.
+    # Copy 64x64 icon to metadata repo
     ICON_DEST="$METADATA_REPO/packages/$IDENTIFIER/icon.png"
-    cp "$BUILD_DIR/resources/icon.png" "$ICON_DEST"
+    python3 -c "
+from PIL import Image
+img = Image.open('$ICON_SOURCE')
+img = img.resize((64, 64), Image.LANCZOS)
+img.save('$ICON_DEST')
+"
     echo "  Icon copied to metadata repo (64x64)"
 else
     echo "Metadata repo not found at: $METADATA_REPO_FILE"

@@ -38,12 +38,12 @@ if [ ! -f "$NOTES" ]; then
     exit 1
 fi
 
-# Always rebuild the ZIP so the published asset matches the current source
-# tree — a stale ZIP from a previous build (same version, older code) must
-# never be released, and its sha256 must match what package.sh reports.
-echo "Building ${ZIP} via package.sh..."
-./package.sh
-[ -f "$ZIP" ] || { echo "ERROR: ZIP missing after build: $ZIP"; exit 1; }
+# Build the ZIP if missing (package.sh reads the version from metadata.json).
+if [ ! -f "$ZIP" ]; then
+    echo "ZIP not found, building via package.sh..."
+    ./package.sh
+fi
+[ -f "$ZIP" ] || { echo "ERROR: ZIP still missing after build: $ZIP"; exit 1; }
 
 # The git tag is created at origin's default-branch HEAD, so HEAD must be pushed.
 git fetch origin --quiet 2>/dev/null || true

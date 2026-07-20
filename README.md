@@ -4,7 +4,7 @@ Generate 3D-printable solder paste stencils directly from KiCad.
 
 ## Installation
 
-### Via KiCad Plugin & Content Manager (PCM) — recommended
+### Via KiCad Plugin & Content Manager (PCM) - recommended
 
 1. Open KiCad → Plugin and Content Manager
 2. Search for "Stenchill"
@@ -60,4 +60,4 @@ Your Gerber files are sent to stenchill.com for processing and are **not stored*
 
 ## License
 
-MIT — see [LICENSE](LICENSE).
+MIT - see [LICENSE](LICENSE).
