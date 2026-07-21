@@ -4,7 +4,7 @@ Shared by the share flow (embeds the JSON inside the upload ZIP so /view can
 reproduce the plugin's exact stencil) and the normal generation flow (drops the
 JSON in the output folder as a record of the settings used).
 
-Pure stdlib, no pcbnew — importable and unit-testable outside KiCad.
+Pure stdlib, no pcbnew; importable and unit-testable outside KiCad.
 """
 from __future__ import annotations
 

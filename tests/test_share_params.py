@@ -4,7 +4,7 @@ import os
 import zipfile
 from pathlib import Path
 
-# Load the pure module by path — importing `plugin.share_params` would run
+# Load the pure module by path; importing `plugin.share_params` would run
 # plugin/__init__.py which pulls in pcbnew (unavailable outside KiCad).
 _MOD_PATH = Path(__file__).resolve().parents[1] / "share_params.py"
 _spec = importlib.util.spec_from_file_location("share_params", _MOD_PATH)

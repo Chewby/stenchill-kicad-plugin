@@ -124,6 +124,6 @@ def test_dispatch_survives_malformed_payloads(payload):
 
 
 def test_dispatch_none_event_type_defaults_to_message():
-    # SSE spec: no `event:` field means type "message" — must not be treated
+    # SSE spec: no `event:` field means type "message"; must not be treated
     # as any known event.
     assert _dispatch(None, '{"stlPath": "abc.zip"}') is None

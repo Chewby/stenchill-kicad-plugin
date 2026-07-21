@@ -107,7 +107,7 @@ def _save_settings(params: dict) -> None:
 
 class _ConfirmDialog(wx.Dialog):
     """Small Stenchill-branded Yes/No confirmation (the native wx.MessageBox
-    shows the host app icon — KiCad — on macOS, which we can't replace)."""
+    shows the host app icon (KiCad) on macOS, which we can't replace)."""
 
     def __init__(self, parent, title, message):
         super().__init__(parent, title=title)
@@ -215,7 +215,7 @@ class StenchillDialog(wx.Dialog):
 
         main_sizer.Add(wx.StaticLine(panel), 0, wx.EXPAND | wx.ALL, 5)
 
-        # Stencil parameters — bounds aligned with the web frontend and server.
+        # Stencil parameters: bounds aligned with the web frontend and server.
         stencil_box = wx.StaticBoxSizer(wx.VERTICAL, panel, "Stencil Parameters")
         grid = wx.FlexGridSizer(3, 2, 8, 16)
         grid.AddGrowableCol(1, 1)
@@ -491,7 +491,7 @@ class StenchillDialog(wx.Dialog):
 
         ``token`` is the generation id captured at launch. Every UI update goes
         through ``ui()``, which drops the update if the user has cancelled or
-        started another generation (token no longer current) — so a cancelled
+        started another generation (token no longer current), so a cancelled
         run can never rewrite the form or a freshly destroyed dialog.
         ``cancel_event`` is set on cancel so the SSE stream aborts promptly
         instead of running to completion just to be discarded.
