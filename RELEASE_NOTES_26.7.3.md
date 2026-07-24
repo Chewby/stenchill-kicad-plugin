@@ -29,7 +29,7 @@ cleanup.
 ## Under the hood
 - Refactored the SSE streaming, gerber export, and generation worker into
   smaller, focused pieces (no behavior change), and added unit tests for the
-  stream assembly. 55 pure-stdlib tests now ship with the source.
+  stream assembly. 60 pure-stdlib tests now ship with the source.
 - The plugin is now covered by static analysis (SonarQube), clean at zero
   issues.
 
