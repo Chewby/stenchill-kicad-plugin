@@ -34,6 +34,7 @@ PLUGIN_FILES=(
     "exporter.py"
     "plugin.py"
     "share_params.py"
+    "window_sizing.py"
 )
 
 # --- Version ---

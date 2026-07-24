@@ -13,6 +13,7 @@ import threading
 import webbrowser
 import zipfile
 from datetime import datetime
+from urllib.parse import urlparse
 
 import wx
 import wx.adv
@@ -24,7 +25,9 @@ def _add_logo(panel, sizer, top_margin: int) -> None:
     logo_path = os.path.join(os.path.dirname(__file__), "icon-96.png")
     if not os.path.exists(logo_path):
         return
-    img = wx.Image(logo_path, wx.BITMAP_TYPE_PNG).Scale(48, 48, wx.IMAGE_QUALITY_BICUBIC)
+    # DIP so the logo keeps its 48x48 visual size at 150/200% display scaling.
+    dim = panel.FromDIP(48)
+    img = wx.Image(logo_path, wx.BITMAP_TYPE_PNG).Scale(dim, dim, wx.IMAGE_QUALITY_BICUBIC)
     sizer.Add(wx.StaticBitmap(panel, bitmap=wx.Bitmap(img)), 0, wx.TOP | wx.ALIGN_CENTER, top_margin)
 
 
@@ -39,6 +42,39 @@ def _open_in_file_manager(path: str) -> None:
             subprocess.run(["xdg-open", path], check=False)
     except Exception:
         pass
+
+
+def _is_trusted_view_url(url: str) -> bool:
+    """The /view URL comes from the share response; only hand https links on
+    stenchill.com to the browser. Anything else is shown as plain text instead
+    of opened, so a misbehaving backend can't redirect the user off-site."""
+    try:
+        parsed = urlparse(url)
+    except Exception:
+        return False
+    return parsed.scheme == "https" and parsed.hostname in ("stenchill.com", "www.stenchill.com")
+
+
+def _extract_generated_files(result_zip: str, gen_dir: str) -> list:
+    """Extract STL/3MF meshes + CREDITS.txt from the result ZIP into gen_dir,
+    returning the list of saved mesh basenames. Path-safe: entries are written
+    under their basename only, so a crafted archive can't escape gen_dir."""
+    saved_files = []
+    with zipfile.ZipFile(result_zip, "r") as zf:
+        for name in zf.namelist():
+            safe_name = os.path.basename(name)
+            if not safe_name or safe_name.startswith('.'):
+                continue
+            is_mesh = safe_name.lower().endswith((".stl", ".3mf"))
+            is_credits = safe_name == "CREDITS.txt"
+            if not (is_mesh or is_credits):
+                continue
+            dest = os.path.join(gen_dir, safe_name)
+            with zf.open(name) as src, open(dest, "wb") as dst:
+                dst.write(src.read())
+            if is_mesh:
+                saved_files.append(safe_name)
+    return saved_files
 
 
 # Default parameter values matching the Stenchill web UI
@@ -56,6 +92,7 @@ _DEFAULTS = {
 
 
 from . import VERSION
+from .window_sizing import clamp_window_size, focus_is_within, wheel_scroll_lines
 _SETTINGS_DIR = os.path.join(os.path.expanduser("~"), ".config", "stenchill")
 _SETTINGS_FILE = os.path.join(_SETTINGS_DIR, "settings.json")
 
@@ -152,7 +189,15 @@ class StenchillDialog(wx.Dialog):
     """Main dialog for Stenchill stencil generation."""
 
     def __init__(self, parent, board):
-        super().__init__(parent, title=f"Stenchill - Stencil Generator v{VERSION}", size=(560, 680))
+        # No hardcoded pixel size: a fixed height authored at 100% scaling gets
+        # clipped under Windows display scaling (150% on 4K screens), pushing the
+        # buttons off-screen. The window is sized to its content at the current
+        # DPI at the end of _build_ui. RESIZE_BORDER lets the user adjust it too.
+        super().__init__(
+            parent,
+            title=f"Stenchill - Stencil Generator v{VERSION}",
+            style=wx.DEFAULT_DIALOG_STYLE | wx.RESIZE_BORDER,
+        )
         self.board = board
         self.result_path = None
         # Generation state: _generating drives the dismiss button label
@@ -175,7 +220,12 @@ class StenchillDialog(wx.Dialog):
         threading.Thread(target=self._check_for_update, daemon=True).start()
 
     def _build_ui(self):
-        panel = wx.Panel(self)
+        # ScrolledWindow (not a plain Panel): if the fitted content ever exceeds
+        # the screen height (small display or extreme scaling), a vertical
+        # scrollbar takes over instead of clipping controls. Horizontal scroll
+        # stays off (rate 0).
+        panel = wx.ScrolledWindow(self)
+        panel.SetScrollRate(0, 10)
         main_sizer = wx.BoxSizer(wx.VERTICAL)
 
         # ── Logo ──
@@ -307,7 +357,7 @@ class StenchillDialog(wx.Dialog):
         main_sizer.Add(dir_sizer, 0, wx.EXPAND | wx.ALL, 10)
 
         # ── Status / Result (share the same space below output folder) ──
-        self.progress = wx.Gauge(panel, range=100, size=(-1, 8))
+        self.progress = wx.Gauge(panel, range=100, size=(-1, self.FromDIP(8)))
         main_sizer.Add(self.progress, 0, wx.EXPAND | wx.LEFT | wx.RIGHT | wx.TOP, 10)
 
         self.status_text = wx.StaticText(panel, label="")
@@ -374,6 +424,10 @@ class StenchillDialog(wx.Dialog):
         _small_font(paypal_link)
         bottom_sizer.Add(paypal_link, 0, wx.ALIGN_CENTER_VERTICAL)
 
+        # Guaranteed minimum gap so the support links never touch the action
+        # buttons when the window is at its fit-to-content minimum width (where
+        # the stretch spacer below collapses to zero). Keeps "PayPal" readable.
+        bottom_sizer.AddSpacer(self.FromDIP(24))
         bottom_sizer.AddStretchSpacer()
 
         # Dynamic dismiss button: "Quit" when idle (closes only this dialog),
@@ -400,8 +454,59 @@ class StenchillDialog(wx.Dialog):
         self.panel = panel
         panel.SetSizer(main_sizer)
 
+        # Size to content at the CURRENT DPI. GetMinSize() measures the scaled
+        # controls, so this grows correctly at 150/175/200% instead of clipping.
+        # Note: progress/status/result widgets are hidden here, so they add no
+        # height yet — _refit_scroll re-runs this once they are revealed.
+        content = main_sizer.GetMinSize()
+        # Virtual size drives the scroll extent; the dialog client area may end
+        # up smaller than this (see clamp below), which is what shows scrollbars.
+        panel.SetVirtualSize(content)
+        # Never open larger than the usable screen: clamp to the display work
+        # area (minus a margin) so a too-tall window scrolls instead of running
+        # its buttons off-screen. The user can still resize (RESIZE_BORDER).
+        work_area = self._current_work_area()
+        target = clamp_window_size(
+            content.width, content.height, work_area.width, work_area.height
+        )
+        self.SetClientSize(target)
+        self.SetMinSize(self.FromDIP(wx.Size(360, 320)))
+
         # Sync shoulder controls with saved setting
         self._on_shoulder_toggle(None)
+
+    def _current_work_area(self):
+        """Client area of the display this dialog sits on (primary as fallback).
+
+        Using the dialog's own display, not the primary one, keeps the clamp
+        correct when KiCad runs on a smaller secondary monitor.
+        """
+        idx = wx.Display.GetFromWindow(self)
+        if idx == wx.NOT_FOUND:
+            idx = 0
+        return wx.Display(idx).GetClientArea()
+
+    def _refit_scroll(self):
+        """Re-apply the content sizing after showing/hiding sizer items.
+
+        The window was fitted with the progress/status/result band hidden, so
+        revealing those widgets adds height that GetMinSize() now includes.
+        Grow the window to fit the new content (clamped to the screen) and
+        refresh the scrollable virtual size, so anything past the screen edge
+        scrolls instead of clipping the buttons — the same guarantee the initial
+        fit gives, held across state changes. Growth only: never shrinks below
+        the current size, to avoid a jarring resize when returning to idle.
+        """
+        self.panel.Layout()
+        content = self.main_sizer.GetMinSize()
+        self.panel.SetVirtualSize(content)
+        work_area = self._current_work_area()
+        cur_w, cur_h = self.GetClientSize()
+        target = clamp_window_size(
+            max(cur_w, content.width), max(cur_h, content.height),
+            work_area.width, work_area.height,
+        )
+        self.SetClientSize(target)
 
     def _add_param(self, panel, grid, label, default, min_val, max_val, tooltip):
         """Add a labeled SpinCtrlDouble to the grid."""
@@ -418,9 +523,28 @@ class StenchillDialog(wx.Dialog):
         ctrl.SetDigits(2)
         ctrl.SetValue(float(default))
         ctrl.SetToolTip(tooltip)
+        # A SpinCtrlDouble eats the mouse wheel to change its value, which stops
+        # the ScrolledWindow from scrolling when the cursor is over a field.
+        # Redirect the wheel to page scrolling UNLESS the field is focused (see
+        # _on_param_wheel), so hovering scrolls but a clicked field still adjusts.
+        ctrl.Bind(wx.EVT_MOUSEWHEEL, self._on_param_wheel)
         grid.Add(ctrl, 1, wx.EXPAND)
 
         return ctrl
+
+    def _on_param_wheel(self, event):
+        """Mouse wheel over a parameter field: scroll the window instead of
+        changing the value, unless the field is focused (deliberate editing)."""
+        ctrl = event.GetEventObject()
+        # FindFocus() returns the SpinCtrlDouble's internal text child, not the
+        # ctrl itself, so match the whole subtree (see focus_is_within).
+        if focus_is_within(wx.Window.FindFocus(), ctrl, wx.Window.GetParent):
+            event.Skip()  # focused field: let the wheel adjust its value
+            return
+        lines = wheel_scroll_lines(
+            event.GetWheelRotation(), event.GetWheelDelta(), event.GetLinesPerAction()
+        )
+        self.panel.ScrollLines(lines)
 
     def _on_shoulder_toggle(self, event):
         """Enable/disable shoulder parameters based on checkbox."""
@@ -445,7 +569,7 @@ class StenchillDialog(wx.Dialog):
         self.status_text.SetLabel("Exporting Gerber layers...")
         self.progress.SetRange(100)
         self.progress.SetValue(0)
-        self.panel.Layout()
+        self._refit_scroll()  # progress + status band just became visible
         # Flush the repaint now: the Gerber export below blocks the UI thread
         # (pcbnew.BOARD is main-thread-only), so without this the busy state
         # would never be painted and KiCad would look hung.
@@ -541,57 +665,7 @@ class StenchillDialog(wx.Dialog):
                 if os.path.exists(zip_path):
                     os.unlink(zip_path)
 
-            # Cancelled (or the dialog was closed) while generating: drop the
-            # result instead of writing STL files to the output folder. The
-            # outer finally still cleans up the downloaded result_zip.
-            if token != self._gen_token:
-                return
-
-            ui(self._set_status, "Saving STL files...")
-
-            # Step 2: Create subfolder and extract STL files
-            timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-            gen_dir = os.path.join(output_dir, f"{board_name}_{timestamp}")
-            os.makedirs(gen_dir, exist_ok=True)
-
-            saved_files = []
-            with zipfile.ZipFile(result_zip, "r") as zf:
-                for name in zf.namelist():
-                    safe_name = os.path.basename(name)
-                    if not safe_name or safe_name.startswith('.'):
-                        continue
-                    is_mesh = safe_name.lower().endswith((".stl", ".3mf"))
-                    is_credits = safe_name == "CREDITS.txt"
-                    if not (is_mesh or is_credits):
-                        continue
-                    dest = os.path.join(gen_dir, safe_name)
-                    with zf.open(name) as src, open(dest, "wb") as dst:
-                        dst.write(src.read())
-                    if is_mesh:
-                        saved_files.append(safe_name)
-
-            # Record of the settings used, next to the STLs (same content the
-            # share flow embeds in the upload ZIP). Best-effort: nothing (bad
-            # disk, missing module in a mis-packaged install, ...) must fail a
-            # generation whose STLs are already saved.
-            try:
-                from .share_params import write_params_json
-                write_params_json(gen_dir, params)
-            except Exception:  # noqa: BLE001
-                pass
-
-            # Cancelled while the files were being written: remove the partial
-            # output so no orphan folder silently appears in the project dir.
-            if token != self._gen_token:
-                shutil.rmtree(gen_dir, ignore_errors=True)
-                return
-
-            if saved_files:
-                files_str = ", ".join(saved_files)
-                folder_name = os.path.basename(gen_dir)
-                ui(self._on_success, f"Saved: {files_str}\nFolder: {folder_name}", gen_dir, params)
-            else:
-                ui(self._on_error, "No STL files found in the API response.")
+            self._save_and_report(result_zip, output_dir, board_name, params, token, ui)
 
         except GenerationCancelled:
             pass  # user cancelled; the finally below cleans up the temp ZIP
@@ -600,6 +674,49 @@ class StenchillDialog(wx.Dialog):
         finally:
             if result_zip and os.path.exists(result_zip):
                 os.unlink(result_zip)
+
+    def _save_and_report(self, result_zip, output_dir, board_name, params, token, ui):
+        """Extract STLs to a timestamped folder, write params.json, and report
+        success/error via ``ui``. Runs on the worker thread. A late cancel
+        (token no longer current) discards the result or the partial folder
+        instead of surfacing it."""
+        # Cancelled (or the dialog was closed) while generating: drop the
+        # result instead of writing STL files to the output folder. The
+        # caller's finally still cleans up the downloaded result_zip.
+        if token != self._gen_token:
+            return
+
+        ui(self._set_status, "Saving STL files...")
+
+        # Create subfolder and extract STL files
+        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        gen_dir = os.path.join(output_dir, f"{board_name}_{timestamp}")
+        os.makedirs(gen_dir, exist_ok=True)
+
+        saved_files = _extract_generated_files(result_zip, gen_dir)
+
+        # Record of the settings used, next to the STLs (same content the
+        # share flow embeds in the upload ZIP). Best-effort: nothing (bad
+        # disk, missing module in a mis-packaged install, ...) must fail a
+        # generation whose STLs are already saved.
+        try:
+            from .share_params import write_params_json
+            write_params_json(gen_dir, params)
+        except Exception:  # noqa: BLE001
+            pass
+
+        # Cancelled while the files were being written: remove the partial
+        # output so no orphan folder silently appears in the project dir.
+        if token != self._gen_token:
+            shutil.rmtree(gen_dir, ignore_errors=True)
+            return
+
+        if saved_files:
+            files_str = ", ".join(saved_files)
+            folder_name = os.path.basename(gen_dir)
+            ui(self._on_success, f"Saved: {files_str}\nFolder: {folder_name}", gen_dir, params)
+        else:
+            ui(self._on_error, "No STL files found in the API response.")
 
     def _set_status(self, text):
         self.status_text.SetLabel(text)
@@ -626,7 +743,7 @@ class StenchillDialog(wx.Dialog):
         self.main_sizer.Show(self.result_btn_sizer, show_open_folder)
         self.generate_btn.Enable()
         self.reset_btn.Enable()
-        self.panel.Layout()
+        self._refit_scroll()  # result text / buttons may have just appeared
 
     def _on_success(self, message, gen_dir, params):
         self._last_gen_dir = gen_dir
@@ -728,19 +845,22 @@ class StenchillDialog(wx.Dialog):
         if error:
             self.result_text.SetForegroundColour(wx.Colour(200, 0, 0))
             self.result_text.SetLabel(f"❌  Could not open 3D view: {error}")
-            self.panel.Layout()
+            self._refit_scroll()
             return
-        try:
-            opened = webbrowser.open(url)
-        except Exception:  # noqa: BLE001
-            opened = False
+        if _is_trusted_view_url(url):
+            try:
+                opened = webbrowser.open(url)
+            except Exception:  # noqa: BLE001
+                opened = False
+        else:
+            opened = False  # untrusted URL: fall through to the text link below
         if opened:
             self.result_text.SetForegroundColour(wx.Colour(0, 128, 0))
             self.result_text.SetLabel("✅  Opened 3D view in your browser.")
         else:
             self.result_text.SetForegroundColour(wx.Colour(100, 100, 100))
             self.result_text.SetLabel(f"\U0001F517  Open this link in your browser:\n{url}")
-        self.panel.Layout()
+        self._refit_scroll()  # link fallback can be two lines: reserve the height
 
     def _on_open_folder(self, event):
         """Open the last generation's output folder in the OS file manager."""
@@ -789,6 +909,6 @@ class StenchillDialog(wx.Dialog):
             self.update_text.SetLabel(f"New version v{latest} available")
             self.main_sizer.Show(self.update_text, True)
             self.main_sizer.Show(self.update_link, True)
-            self.panel.Layout()
+            self._refit_scroll()  # update notice band just became visible
         except RuntimeError:
             pass  # dialog was closed before the version check returned

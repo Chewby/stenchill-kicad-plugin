@@ -34,7 +34,7 @@
     ],
     "versions": [
         {
-            "version": "26.7.2",
+            "version": "26.7.3",
             "status": "stable",
             "kicad_version": "8.0"
         }

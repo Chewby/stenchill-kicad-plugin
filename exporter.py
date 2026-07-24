@@ -20,6 +20,95 @@ _LAYERS_TO_EXPORT = [
 ]
 
 
+def _configure_plot_options(po, gerber_dir: str) -> None:
+    """Configure the plot controller for X2 Gerber output (paste + edge cuts)."""
+    po.SetOutputDirectory(gerber_dir)
+    po.SetPlotFrameRef(False)
+    po.SetSketchPadsOnFabLayers(False)
+    po.SetUseGerberProtelExtensions(False)
+    po.SetUseGerberX2format(True)
+    po.SetIncludeGerberNetlistInfo(False)
+    po.SetSubtractMaskFromSilk(False)
+    po.SetDrillMarksType(0)  # NO_DRILL_SHAPE - exclude through-hole drill marks
+
+
+def _plot_export_layers(pc, board_name: str) -> list:
+    """Plot each export layer; return the deduped list of written file paths."""
+    plot_files = []
+    for layer_id, layer_suffix, _desc in _LAYERS_TO_EXPORT:
+        filename = f"{board_name}-{layer_suffix}"
+        pc.SetLayer(layer_id)
+        if not pc.OpenPlotfile(filename, pcbnew.PLOT_FORMAT_GERBER, layer_suffix):
+            pc.ClosePlot()
+            raise RuntimeError(f"KiCad could not open the plot file for {layer_suffix}.")
+        pc.PlotLayer()
+        plot_file = pc.GetPlotFileName()
+        pc.ClosePlot()
+        if plot_file:
+            plot_files.append(plot_file)
+    # A failed/blank GetPlotFileName can repeat the previous layer's path;
+    # dedupe so no file is zipped twice under one arcname.
+    return list(dict.fromkeys(plot_files))
+
+
+def _resolve_gerber_files(plot_files: list, tmpdir: str,
+                          expected_board_paths: list, preexisting: set) -> list:
+    """Existing plotted files, with a glob fallback for KiCad versions where
+    GetPlotFileName is empty: search the temp dir plus board-dir files that did
+    not exist before this plot (freshly written by KiCad, not the user's)."""
+    found_gerbers = [f for f in plot_files if os.path.exists(f)]
+    if not found_gerbers:
+        found_gerbers = glob.glob(os.path.join(tmpdir, "**", "*.gbr"), recursive=True)
+        found_gerbers.extend(
+            p for p in expected_board_paths
+            if p not in preexisting and os.path.exists(p)
+        )
+    return found_gerbers
+
+
+def _board_dir_strays(found_gerbers: list, board_dir: str) -> list:
+    """Files KiCad wrote next to the board (it sometimes resolves the output
+    dir relative to the board): ours to clean up afterwards."""
+    if not board_dir:
+        return []
+    board_dir_abs = os.path.abspath(board_dir)
+    return [
+        f for f in found_gerbers
+        if os.path.dirname(os.path.abspath(f)) == board_dir_abs
+    ]
+
+
+def _select_exportable_gerbers(found_gerbers: list, tmpdir: str,
+                               gerber_dir: str, board_dir: str) -> list:
+    """Return the non-empty gerbers to zip; raise if none were found, all are
+    empty, or no paste layer is present."""
+    if not found_gerbers:
+        # Diagnostic: list what IS in the temp dir
+        all_files = []
+        for root, _dirs, files in os.walk(tmpdir):
+            for f in files:
+                all_files.append(os.path.join(root, f))
+        raise RuntimeError(
+            f"No .gbr files found.\n"
+            f"Temp dir: {gerber_dir}\n"
+            f"Board dir: {board_dir}\n"
+            f"Files in temp: {all_files}"
+        )
+
+    exported_files = [f for f in found_gerbers if os.path.getsize(f) > 0]
+    if not exported_files:
+        raise RuntimeError("Gerber files were generated but are all empty.")
+
+    # Check that at least one paste layer was exported
+    has_paste = any("Paste" in os.path.basename(f) for f in exported_files)
+    if not has_paste:
+        raise RuntimeError(
+            "No paste layer found. Make sure your PCB has pads with "
+            "solder paste enabled (check pad properties)."
+        )
+    return exported_files
+
+
 def export_gerber_zip(board: "pcbnew.BOARD") -> str:
     """
     Export paste layers and edge cuts as Gerber files, packaged in a ZIP.
@@ -36,28 +125,12 @@ def export_gerber_zip(board: "pcbnew.BOARD") -> str:
             gerber_dir = os.path.join(tmpdir, "gerbers")
             os.makedirs(gerber_dir)
 
-            exported_files = []
-            board_gerbers = []
             pc = pcbnew.PLOT_CONTROLLER(board)
-            po = pc.GetPlotOptions()
-
-            # Configure plot options for Gerber output
-            po.SetOutputDirectory(gerber_dir)
-            po.SetPlotFrameRef(False)
-            po.SetSketchPadsOnFabLayers(False)
-            po.SetUseGerberProtelExtensions(False)
-            po.SetUseGerberX2format(True)
-            po.SetIncludeGerberNetlistInfo(False)
-            po.SetSubtractMaskFromSilk(False)
-            po.SetDrillMarksType(0)  # NO_DRILL_SHAPE - exclude through-hole drill marks
+            _configure_plot_options(pc.GetPlotOptions(), gerber_dir)
 
             board_name = os.path.splitext(os.path.basename(board.GetFileName()))[0]
             board_dir = os.path.dirname(board.GetFileName())
 
-            # Ask the plot controller for the exact file it wrote, rather than
-            # guessing afterwards by globbing: a pre-existing .gbr in the board
-            # directory (e.g. from a manual File > Plot) must never be zipped
-            # (stale layer) nor deleted (it belongs to the user).
             # Snapshot the expected board-dir paths that exist BEFORE plotting:
             # anything in this set was NOT written by us and must be neither
             # zipped (stale layer) nor deleted (it belongs to the user).
@@ -67,71 +140,16 @@ def export_gerber_zip(board: "pcbnew.BOARD") -> str:
             ] if board_dir else []
             preexisting = {p for p in expected_board_paths if os.path.exists(p)}
 
-            plot_files = []
-            for layer_id, layer_suffix, _desc in _LAYERS_TO_EXPORT:
-                filename = f"{board_name}-{layer_suffix}"
-                pc.SetLayer(layer_id)
-                if not pc.OpenPlotfile(filename, pcbnew.PLOT_FORMAT_GERBER, layer_suffix):
-                    pc.ClosePlot()
-                    raise RuntimeError(f"KiCad could not open the plot file for {layer_suffix}.")
-                pc.PlotLayer()
-                plot_file = pc.GetPlotFileName()
-                pc.ClosePlot()
-                if plot_file:
-                    plot_files.append(plot_file)
-            # A failed/blank GetPlotFileName can repeat the previous layer's
-            # path; dedupe so no file is zipped twice under one arcname.
-            plot_files = list(dict.fromkeys(plot_files))
-
-            found_gerbers = [f for f in plot_files if os.path.exists(f)]
-            if not found_gerbers:
-                # Fallback for KiCad versions where GetPlotFileName is empty:
-                # search the temp dir, plus board-dir files that did not exist
-                # before this plot (i.e. freshly written by KiCad, not the user's).
-                found_gerbers = glob.glob(os.path.join(tmpdir, "**", "*.gbr"), recursive=True)
-                found_gerbers.extend(
-                    p for p in expected_board_paths
-                    if p not in preexisting and os.path.exists(p)
-                )
-
-            # Files KiCad wrote next to the board (it sometimes resolves the
-            # output dir relative to the board): ours to clean up afterwards.
-            if board_dir:
-                board_dir_abs = os.path.abspath(board_dir)
-                board_gerbers = [
-                    f for f in found_gerbers
-                    if os.path.dirname(os.path.abspath(f)) == board_dir_abs
-                ]
+            plot_files = _plot_export_layers(pc, board_name)
+            found_gerbers = _resolve_gerber_files(
+                plot_files, tmpdir, expected_board_paths, preexisting
+            )
+            board_gerbers = _board_dir_strays(found_gerbers, board_dir)
 
             try:
-                if not found_gerbers:
-                    # Diagnostic: list what IS in the temp dir
-                    all_files = []
-                    for root, dirs, files in os.walk(tmpdir):
-                        for f in files:
-                            all_files.append(os.path.join(root, f))
-                    raise RuntimeError(
-                        f"No .gbr files found.\n"
-                        f"Temp dir: {gerber_dir}\n"
-                        f"Board dir: {board_dir}\n"
-                        f"Files in temp: {all_files}"
-                    )
-
-                for gerber_file in found_gerbers:
-                    if os.path.getsize(gerber_file) > 0:
-                        exported_files.append(gerber_file)
-
-                if not exported_files:
-                    raise RuntimeError("Gerber files were generated but are all empty.")
-
-                # Check that at least one paste layer was exported
-                has_paste = any("Paste" in os.path.basename(f) for f in exported_files)
-                if not has_paste:
-                    raise RuntimeError(
-                        "No paste layer found. Make sure your PCB has pads with "
-                        "solder paste enabled (check pad properties)."
-                    )
-
+                exported_files = _select_exportable_gerbers(
+                    found_gerbers, tmpdir, gerber_dir, board_dir
+                )
                 with zipfile.ZipFile(zip_path, "w", zipfile.ZIP_DEFLATED) as zf:
                     for filepath in exported_files:
                         zf.write(filepath, os.path.basename(filepath))

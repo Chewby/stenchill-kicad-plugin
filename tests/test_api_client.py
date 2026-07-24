@@ -127,3 +127,49 @@ def test_dispatch_none_event_type_defaults_to_message():
     # SSE spec: no `event:` field means type "message"; must not be treated
     # as any known event.
     assert _dispatch(None, '{"stlPath": "abc.zip"}') is None
+
+
+# ── _read_sse_stream (assembly loop extracted from generate_stencil_stream) ──
+
+def test_read_sse_stream_returns_stlpath_and_dispatches_progress():
+    lines = [
+        b"event: progress\n",
+        b'data: {"step": 2, "total": 5, "label": "x"}\n',
+        b"\n",
+        b"event: complete\n",
+        b'data: {"stlPath": "result-abc.zip"}\n',
+        b"\n",
+    ]
+    seen = []
+    result = api_client._read_sse_stream(
+        iter(lines), None, lambda *a: seen.append(a), None
+    )
+    assert result == "result-abc.zip"
+    assert seen and seen[0][0] == 2  # step forwarded to on_progress
+
+
+def test_read_sse_stream_dispatches_final_event_without_trailing_blank():
+    # A 'complete' event not terminated by a blank line must still be flushed.
+    lines = [b"event: complete\n", b'data: {"stlPath": "r.zip"}\n']
+    assert api_client._read_sse_stream(iter(lines), None, None, None) == "r.zip"
+
+
+def test_read_sse_stream_ignores_comments_and_unknown_fields():
+    lines = [
+        b": keep-alive ping\n",
+        b"id: 42\n",
+        b"retry: 3000\n",
+        b"event: complete\n",
+        b'data: {"stlPath": "ok.zip"}\n',
+        b"\n",
+    ]
+    assert api_client._read_sse_stream(iter(lines), None, None, None) == "ok.zip"
+
+
+def test_read_sse_stream_honours_cancel_event_between_lines():
+    class _AlwaysSet:
+        def is_set(self):
+            return True
+
+    with pytest.raises(api_client.GenerationCancelled):
+        api_client._read_sse_stream(iter([b"data: {}\n"]), _AlwaysSet(), None, None)

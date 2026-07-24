@@ -186,7 +186,7 @@ def _dispatch_sse_event(event_type, data_str, on_progress, on_queued):
         event_type = "message"
     try:
         data = json.loads(data_str)
-    except (json.JSONDecodeError, ValueError):
+    except ValueError:  # JSONDecodeError is a subclass of ValueError
         return None
     if not isinstance(data, dict):
         return None
@@ -311,6 +311,73 @@ def share_stencil(zip_path: str, params: dict | None = None) -> str:
         raise ApiError(f"Could not reach the server: {e.reason}")
 
 
+def _flush_sse_event(event_type, data_lines, on_progress, on_queued):
+    """Dispatch an assembled SSE event if it carried data lines, else None."""
+    if not data_lines:
+        return None
+    return _dispatch_sse_event(event_type, "\n".join(data_lines), on_progress, on_queued)
+
+
+def _read_sse_stream(resp, cancel_event, on_progress, on_queued):
+    """Consume an SSE response and return the final stlPath (from the
+    'complete' event) or None.
+
+    Spec-conformant assembly: data lines accumulate until a blank line ends the
+    event (multi-line data joined with "\\n"); comment lines (": ping"
+    keep-alives) and unknown fields (id:, retry:) are ignored. Honours
+    cancel_event between lines; propagates ApiError from an 'error' event.
+    """
+    stl_path = None
+    event_type = None
+    data_lines = []
+    for raw_line in resp:
+        if cancel_event is not None and cancel_event.is_set():
+            raise GenerationCancelled()
+        line = raw_line.decode("utf-8", errors="replace").rstrip("\n\r")
+        if not line:
+            result = _flush_sse_event(event_type, data_lines, on_progress, on_queued)
+            if result is not None:
+                stl_path = result
+            event_type = None
+            data_lines = []
+        elif line.startswith(":"):
+            pass  # comment / keep-alive
+        elif line.startswith("event:"):
+            event_type = line[6:].strip()
+        elif line.startswith("data:"):
+            data_lines.append(line[5:].lstrip(" "))
+
+    # Dispatch a final event not terminated by a blank line.
+    result = _flush_sse_event(event_type, data_lines, on_progress, on_queued)
+    if result is not None:
+        stl_path = result
+    return stl_path
+
+
+def _download_result(download_url, ctx, cancel_event):
+    """Stream the result ZIP to a temp file, honouring cancel_event mid-download.
+    Returns the temp file path; removes the temp file on any failure."""
+    dl_req = Request(download_url, headers={"User-Agent": _get_user_agent(), "X-API-Key": API_KEY})
+    with urlopen(dl_req, timeout=TIMEOUT_SECONDS, context=ctx) as dl_resp:
+        tmp = tempfile.NamedTemporaryFile(suffix=".zip", prefix="stenchill_result_", delete=False)
+        try:
+            # Stream in chunks: constant memory for multi-MB results, and
+            # cancellation is honoured mid-download.
+            while True:
+                if cancel_event is not None and cancel_event.is_set():
+                    raise GenerationCancelled()
+                chunk = dl_resp.read(64 * 1024)
+                if not chunk:
+                    break
+                tmp.write(chunk)
+            tmp.close()
+            return tmp.name
+        except Exception:
+            tmp.close()
+            os.unlink(tmp.name)
+            raise
+
+
 def generate_stencil_stream(
     zip_path: str,
     on_progress=None,
@@ -354,74 +421,21 @@ def generate_stencil_stream(
 
     try:
         with urlopen(req, timeout=TIMEOUT_SECONDS, context=ctx) as resp:
-            stl_path = None
-            # Spec-conformant SSE assembly: data lines accumulate until a blank
-            # line ends the event (multi-line data is joined with "\n"),
-            # comment lines (": ping" keep-alives) and unknown fields (id:,
-            # retry:) are ignored.
-            event_type = None
-            data_lines = []
+            stl_path = _read_sse_stream(resp, cancel_event, on_progress, on_queued)
 
-            for raw_line in resp:
-                if cancel_event is not None and cancel_event.is_set():
-                    raise GenerationCancelled()
-                line = raw_line.decode("utf-8", errors="replace").rstrip("\n\r")
+        if cancel_event is not None and cancel_event.is_set():
+            raise GenerationCancelled()
 
-                if not line:
-                    if data_lines:
-                        result = _dispatch_sse_event(
-                            event_type, "\n".join(data_lines), on_progress, on_queued
-                        )
-                        if result is not None:
-                            stl_path = result
-                    event_type = None
-                    data_lines = []
-                elif line.startswith(":"):
-                    pass  # comment / keep-alive
-                elif line.startswith("event:"):
-                    event_type = line[6:].strip()
-                elif line.startswith("data:"):
-                    data_lines.append(line[5:].lstrip(" "))
+        if not stl_path:
+            raise ApiError("No result received from server")
 
-            # Dispatch a final event not terminated by a blank line.
-            if data_lines:
-                result = _dispatch_sse_event(
-                    event_type, "\n".join(data_lines), on_progress, on_queued
-                )
-                if result is not None:
-                    stl_path = result
+        # Validate download path (whitelist matching server-side regex).
+        # \Z, not $, so a trailing newline can't slip through the whitelist.
+        if not re.match(r'^[a-zA-Z0-9._-]+\.zip\Z', stl_path):
+            raise ApiError("Invalid download path received from server")
 
-            if cancel_event is not None and cancel_event.is_set():
-                raise GenerationCancelled()
-
-            if not stl_path:
-                raise ApiError("No result received from server")
-
-            # Validate download path (whitelist matching server-side regex)
-            if not re.match(r'^[a-zA-Z0-9._-]+\.zip$', stl_path):
-                raise ApiError("Invalid download path received from server")
-
-            # Download the result ZIP
-            download_url = f"{API_BASE}/download/{stl_path}"
-            dl_req = Request(download_url, headers={"User-Agent": _get_user_agent(), "X-API-Key": API_KEY})
-            with urlopen(dl_req, timeout=TIMEOUT_SECONDS, context=ctx) as dl_resp:
-                tmp = tempfile.NamedTemporaryFile(suffix=".zip", prefix="stenchill_result_", delete=False)
-                try:
-                    # Stream in chunks: constant memory for multi-MB results,
-                    # and cancellation is honoured mid-download.
-                    while True:
-                        if cancel_event is not None and cancel_event.is_set():
-                            raise GenerationCancelled()
-                        chunk = dl_resp.read(64 * 1024)
-                        if not chunk:
-                            break
-                        tmp.write(chunk)
-                    tmp.close()
-                    return tmp.name
-                except Exception:
-                    tmp.close()
-                    os.unlink(tmp.name)
-                    raise
+        download_url = f"{API_BASE}/download/{stl_path}"
+        return _download_result(download_url, ctx, cancel_event)
 
     except HTTPError as e:
         detail = "Unknown error"
