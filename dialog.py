@@ -45,13 +45,17 @@ def _open_in_file_manager(path: str) -> None:
 
 
 def _is_trusted_view_url(url: str) -> bool:
-    """The /view URL comes from the share response; only hand https links on
-    stenchill.com to the browser. Anything else is shown as plain text instead
-    of opened, so a misbehaving backend can't redirect the user off-site."""
+    """The /view URL comes from the share response; only hand trusted links to
+    the browser. Anything else is shown as plain text instead of opened, so a
+    misbehaving backend can't redirect the user off-site. Trusted:
+    https://stenchill.com (production) or a localhost / 127.0.0.1 URL on any
+    port (local development against a dev backend)."""
     try:
         parsed = urlparse(url)
     except Exception:
         return False
+    if parsed.hostname in ("localhost", "127.0.0.1"):
+        return parsed.scheme in ("http", "https")
     return parsed.scheme == "https" and parsed.hostname in ("stenchill.com", "www.stenchill.com")
 
 
