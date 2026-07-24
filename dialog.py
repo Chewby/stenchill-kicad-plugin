@@ -840,31 +840,38 @@ class StenchillDialog(wx.Dialog):
         threading.Thread(target=worker, daemon=True).start()
 
     def _on_view_3d_done(self, url, error, token):
-        """Back on the UI thread: open the browser or show the error."""
-        if token != self._gen_token:
-            return  # dialog closed while the share upload was in flight
-        self.view_3d_btn.Enable(True)
-        self.generate_btn.Enable()
-        self.reset_btn.Enable()
-        if error:
-            self.result_text.SetForegroundColour(wx.Colour(200, 0, 0))
-            self.result_text.SetLabel(f"❌  Could not open 3D view: {error}")
-            self._refit_scroll()
-            return
-        if _is_trusted_view_url(url):
-            try:
-                opened = webbrowser.open(url)
-            except Exception:  # noqa: BLE001
-                opened = False
-        else:
-            opened = False  # untrusted URL: fall through to the text link below
-        if opened:
-            self.result_text.SetForegroundColour(wx.Colour(0, 128, 0))
-            self.result_text.SetLabel("✅  Opened 3D view in your browser.")
-        else:
-            self.result_text.SetForegroundColour(wx.Colour(100, 100, 100))
-            self.result_text.SetLabel(f"\U0001F517  Open this link in your browser:\n{url}")
-        self._refit_scroll()  # link fallback can be two lines: reserve the height
+        """Back on the UI thread: open the browser or show the error.
+
+        Wrapped in try/except RuntimeError (same as _show_update_notice): if
+        the dialog was destroyed while the share upload was in flight, touching
+        the dead wx objects must not surface a traceback in KiCad."""
+        try:
+            if token != self._gen_token:
+                return  # dialog closed while the share upload was in flight
+            self.view_3d_btn.Enable(True)
+            self.generate_btn.Enable()
+            self.reset_btn.Enable()
+            if error:
+                self.result_text.SetForegroundColour(wx.Colour(200, 0, 0))
+                self.result_text.SetLabel(f"❌  Could not open 3D view: {error}")
+                self._refit_scroll()
+                return
+            if _is_trusted_view_url(url):
+                try:
+                    opened = webbrowser.open(url)
+                except Exception:  # noqa: BLE001
+                    opened = False
+            else:
+                opened = False  # untrusted URL: fall through to the text link below
+            if opened:
+                self.result_text.SetForegroundColour(wx.Colour(0, 128, 0))
+                self.result_text.SetLabel("✅  Opened 3D view in your browser.")
+            else:
+                self.result_text.SetForegroundColour(wx.Colour(100, 100, 100))
+                self.result_text.SetLabel(f"\U0001F517  Open this link in your browser:\n{url}")
+            self._refit_scroll()  # link fallback can be two lines: reserve the height
+        except RuntimeError:
+            pass  # dialog destroyed mid-upload; nothing left to update
 
     def _on_open_folder(self, event):
         """Open the last generation's output folder in the OS file manager."""
@@ -894,7 +901,13 @@ class StenchillDialog(wx.Dialog):
 
     def _close_dialog(self):
         """Dismiss this dialog alone: EndModal when shown via ShowModal,
-        otherwise Destroy. Never touches the parent frame."""
+        otherwise Destroy. Never touches the parent frame.
+
+        Bumps the generation token here too: the Quit path reaches this without
+        going through _on_close (EndModal fires no EVT_CLOSE), and a share
+        upload may still be in flight — its late wx.CallAfter callback must not
+        touch the destroyed dialog."""
+        self._gen_token += 1
         if self.IsModal():
             self.EndModal(wx.ID_CANCEL)
         else:
