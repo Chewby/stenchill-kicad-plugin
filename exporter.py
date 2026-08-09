@@ -8,16 +8,27 @@ import glob
 import os
 import tempfile
 import zipfile
+from typing import TYPE_CHECKING
 
-import pcbnew
+if TYPE_CHECKING:  # jamais evalue a l'execution : sert l'annotation de export_gerber_zip
+    import pcbnew
+
+# `pcbnew` n'est importe qu'a l'appel, et non en tete de module. Il n'existe que
+# dans l'interpreteur embarque de KiCad, or les quatre fonctions ci-dessous sont
+# pures : les charger ne doit pas exiger KiCad, sinon elles restent hors de
+# portee des tests. A l'interieur de KiCad le module est toujours la, donc le
+# seul effet observable est le moment de l'echec en son absence, passe de
+# l'import du plugin a l'export lui-meme.
 
 
-# Layers to export: paste layers + board outline
-_LAYERS_TO_EXPORT = [
-    (pcbnew.F_Paste, "F_Paste", "Front paste"),
-    (pcbnew.B_Paste, "B_Paste", "Back paste"),
-    (pcbnew.Edge_Cuts, "Edge_Cuts", "Board outline"),
-]
+def _layers_to_export() -> list:
+    """Layers to export: paste layers + board outline."""
+    import pcbnew
+    return [
+        (pcbnew.F_Paste, "F_Paste", "Front paste"),
+        (pcbnew.B_Paste, "B_Paste", "Back paste"),
+        (pcbnew.Edge_Cuts, "Edge_Cuts", "Board outline"),
+    ]
 
 
 def _configure_plot_options(po, gerber_dir: str) -> None:
@@ -34,8 +45,9 @@ def _configure_plot_options(po, gerber_dir: str) -> None:
 
 def _plot_export_layers(pc, board_name: str) -> list:
     """Plot each export layer; return the deduped list of written file paths."""
+    import pcbnew
     plot_files = []
-    for layer_id, layer_suffix, _desc in _LAYERS_TO_EXPORT:
+    for layer_id, layer_suffix, _desc in _layers_to_export():
         filename = f"{board_name}-{layer_suffix}"
         pc.SetLayer(layer_id)
         if not pc.OpenPlotfile(filename, pcbnew.PLOT_FORMAT_GERBER, layer_suffix):
@@ -116,6 +128,7 @@ def export_gerber_zip(board: "pcbnew.BOARD") -> str:
     Returns the path to the temporary ZIP file.
     The caller is responsible for deleting it.
     """
+    import pcbnew
     zip_tmp = tempfile.NamedTemporaryFile(suffix=".zip", prefix="stenchill_gerbers_", delete=False)
     zip_path = zip_tmp.name
     zip_tmp.close()
@@ -136,7 +149,7 @@ def export_gerber_zip(board: "pcbnew.BOARD") -> str:
             # zipped (stale layer) nor deleted (it belongs to the user).
             expected_board_paths = [
                 os.path.join(board_dir, f"{board_name}-{suffix}.gbr")
-                for _, suffix, _ in _LAYERS_TO_EXPORT
+                for _, suffix, _ in _layers_to_export()
             ] if board_dir else []
             preexisting = {p for p in expected_board_paths if os.path.exists(p)}
 

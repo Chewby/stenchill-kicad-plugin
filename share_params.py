@@ -21,6 +21,7 @@ _KEY_MAP = {
     "shrink": "shrink",
     "nozzle_diameter": "nozzleDiameter",
     "enable_slotify": "enableSlotify",
+    "drop_unprintable_grids": "dropUnprintableGrids",
     "enable_shoulders": "enableShoulders",
     "pcb_thickness": "pcbThickness",
     "shoulder_length": "shoulderLength",

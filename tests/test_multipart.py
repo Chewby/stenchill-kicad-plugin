@@ -31,9 +31,20 @@ def test_file_multipart_has_file_part_and_boundary(tmp_path):
 
 def test_full_multipart_includes_params(tmp_path):
     body, headers = api_client._build_multipart(
-        _write_zip(tmp_path), 0.4, 0.0, 1.6, 15.0, 3.0, True, 0.3, 0.2, False
+        _write_zip(tmp_path), 0.4, 0.0, 1.6, 15.0, 3.0, True, 0.3, 0.2, False, True
     )
     assert b'name="file"' in body
     assert b'name="thickness"' in body
     assert b'name="enableSlotify"' in body
     assert b"0.4" in body
+
+
+def test_full_multipart_sends_the_grid_flag_as_a_lowercase_boolean(tmp_path):
+    """Le plugin n'envoyait pas dropUnprintableGrids, et se reposait sur le
+    defaut serveur. Il l'envoie desormais, comme le site."""
+    body, _ = api_client._build_multipart(
+        _write_zip(tmp_path), 0.4, 0.0, 1.6, 15.0, 3.0, True, 0.3, 0.2, True, False
+    )
+
+    assert b'name="dropUnprintableGrids"' in body
+    assert body.split(b'name="dropUnprintableGrids"')[1].strip().startswith(b"false")

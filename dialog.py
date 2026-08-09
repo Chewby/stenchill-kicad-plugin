@@ -9,11 +9,11 @@ import os
 import shutil
 import subprocess
 import sys
+import textwrap
 import threading
 import webbrowser
 import zipfile
 from datetime import datetime
-from urllib.parse import urlparse
 
 import wx
 import wx.adv
@@ -44,21 +44,6 @@ def _open_in_file_manager(path: str) -> None:
         pass
 
 
-def _is_trusted_view_url(url: str) -> bool:
-    """The /view URL comes from the share response; only hand trusted links to
-    the browser. Anything else is shown as plain text instead of opened, so a
-    misbehaving backend can't redirect the user off-site. Trusted:
-    https://stenchill.com (production) or a localhost / 127.0.0.1 URL on any
-    port (local development against a dev backend)."""
-    try:
-        parsed = urlparse(url)
-    except Exception:
-        return False
-    if parsed.hostname in ("localhost", "127.0.0.1"):
-        return parsed.scheme in ("http", "https")
-    return parsed.scheme == "https" and parsed.hostname in ("stenchill.com", "www.stenchill.com")
-
-
 def _extract_generated_files(result_zip: str, gen_dir: str) -> list:
     """Extract STL/3MF meshes + CREDITS.txt from the result ZIP into gen_dir,
     returning the list of saved mesh basenames. Path-safe: entries are written
@@ -81,12 +66,35 @@ def _extract_generated_files(result_zip: str, gen_dir: str) -> list:
     return saved_files
 
 
+# Espacement des trois groupes de reglages. wx.TOP sur chacun donne un ecart
+# regulier entre eux ; seule la derniere boite ajoute wx.BOTTOM, sans quoi
+# l'ecart avant le selecteur de dossier serait double.
+_GROUP_MARGIN = 10
+# Ecart entre le titre d'un groupe et sa boite.
+_GROUP_HEAD_GAP = 4
+
+# Largeur de coupe du texte de l'encart d'aide. wx.adv.RichToolTip n'enroule
+# PAS : sans cela la bulle s'etire sur une seule ligne, plus large que l'ecran.
+_HELP_WRAP_COLUMNS = 62
+
+# Marge interieure d'une boite, IDENTIQUE sur les quatre cotes pour tous les
+# elements : le border d'un Add s'applique a tous les cotes marques, donc y
+# demander une valeur differente en haut decale aussi la gauche, et les elements
+# d'un meme groupe cessent d'etre alignes. L'air en haut se pose par un
+# intercalaire, jamais par un border.
+_BOX_PAD = 8
+_BOX_TOP_EXTRA = 4
+
 # Default parameter values matching the Stenchill web UI
 _DEFAULTS = {
     "thickness": 0.4,
     "shrink": 0.0,
     "nozzle_diameter": 0.4,
     "enable_slotify": True,
+    # Defaut a True comme sur les deux points d'entree du serveur : une matrice
+    # a pas fin dont les parois passent sous la buse sort en flaque si on la
+    # laisse ouverte (cf. stencilgen/grid_blocks.py).
+    "drop_unprintable_grids": True,
     "enable_shoulders": True,
     "pcb_thickness": 1.6,
     "shoulder_length": 15.0,
@@ -216,6 +224,8 @@ class StenchillDialog(wx.Dialog):
         # if the user tweaked the form after generating.
         self._last_gen_params = None
         self._settings = _load_settings()
+        # id du widget -> (titre, texte) de chaque pastille d'aide.
+        self._help_entries = {}
         self._build_ui()
         self.CenterOnParent()
         # Route the window [X] / Escape through our own handler so it only
@@ -269,66 +279,126 @@ class StenchillDialog(wx.Dialog):
 
         main_sizer.Add(wx.StaticLine(panel), 0, wx.EXPAND | wx.ALL, 5)
 
-        # Stencil parameters: bounds aligned with the web frontend and server.
-        stencil_box = wx.StaticBoxSizer(wx.VERTICAL, panel, "Stencil Parameters")
-        grid = wx.FlexGridSizer(3, 2, 8, 16)
+        # Trois groupes, dans l'ordre et sous les intitules du site
+        # (stencil-options.component.html) : Printability, Stencil, Alignment.
+        # Les libellés et les infobulles reprennent les siens mot pour mot, pour
+        # qu'un utilisateur qui passe du site au plugin reconnaisse les memes
+        # reglages. Le site est la reference parce que c'est lui qui est traduit
+        # en quinze langues ; le plugin n'existe qu'en anglais.
+        #
+        # Parent = la StaticBox et non le panneau, pour tout ce qui atterrit dans
+        # un de ces sizers. wx l'exige depuis 3.1 et le signale a chaque
+        # construction ; sur macOS le mauvais parentage s'affiche quand meme,
+        # mais sous Windows et GTK il produit des defauts d'ordre de plan et de
+        # decoupe, jusqu'a une case qui ne repond plus au clic selon le theme.
+
+        # ── Printability ──
+        printability_box = self._add_group_box(panel, main_sizer, "Printability")
+        printability_parent = printability_box.GetStaticBox()
+
+        printability_box.AddSpacer(_BOX_TOP_EXTRA)
+
+        self.slotify_cb = wx.CheckBox(printability_parent, label="Merge close pads")
+        self.slotify_cb.SetValue(self._settings["enable_slotify"])
+        self._labelled_toggle(
+            printability_parent, printability_box, self.slotify_cb,
+            "When pads are too close for the nozzle, fuses each row into a single "
+            "slot to avoid walls thinner than the nozzle that won't print correctly.",
+            wx.ALL,
+        )
+
+        self.drop_grids_cb = wx.CheckBox(printability_parent,
+                                         label="Fill in unprintable grids")
+        self.drop_grids_cb.SetValue(self._settings["drop_unprintable_grids"])
+        self._labelled_toggle(
+            printability_parent, printability_box, self.drop_grids_cb,
+            "A fine-pitch BGA has walls thinner than your nozzle. Left as openings, "
+            "they print as one big puddle. On a BGA the balls carry the solder, so "
+            "filling them in costs nothing; on an LGA you will need a finer nozzle.",
+            wx.LEFT | wx.RIGHT | wx.BOTTOM,
+        )
+
+        # ── Stencil ──
+        # Bornes alignees sur celles du site et du serveur.
+        stencil_box = self._add_group_box(panel, main_sizer, "Stencil")
+        stencil_parent = stencil_box.GetStaticBox()
+        grid = wx.FlexGridSizer(3, 3, 8, 16)
         grid.AddGrowableCol(1, 1)
 
         self.thickness_ctrl = self._add_param(
-            panel, grid, "Thickness (mm):", self._settings["thickness"], 0.05, 1.0,
-            "Stencil plate thickness - typical: 0.3-0.4 mm"
+            stencil_parent, grid, "Thickness (mm):", self._settings["thickness"], 0.05, 1.0,
+            "Stencil thickness. Defines solder paste deposit. "
+            "0.3-0.4 mm for most SMD components."
         )
         self.shrink_ctrl = self._add_param(
-            panel, grid, "Shrink (mm):", self._settings["shrink"], -1.0, 5.0,
+            stencil_parent, grid, "Shrink (mm):", self._settings["shrink"], -1.0, 5.0,
             "Pad reduction - negative values enlarge pads"
         )
+        # La recommandation vit sous le champ, comme le mat-hint du site, et non
+        # dans le libelle : « Nozzle (mm), 0.2 rec.: » etait illisible.
         self.nozzle_ctrl = self._add_param(
-            panel, grid, "Nozzle (mm), 0.2 rec.:", self._settings["nozzle_diameter"], 0.1, 1.5,
+            stencil_parent, grid, "Nozzle (mm):", self._settings["nozzle_diameter"],
+            0.1, 1.5,
             "Your 3D printer nozzle size - 0.2 mm recommended for best results"
         )
 
-        stencil_box.Add(grid, 0, wx.EXPAND | wx.ALL, 8)
+        stencil_box.AddSpacer(_BOX_TOP_EXTRA)
+        stencil_box.Add(grid, 0, wx.EXPAND | wx.ALL, _BOX_PAD)
 
-        self.slotify_cb = wx.CheckBox(panel, label="Merge close pads")
-        self.slotify_cb.SetValue(self._settings["enable_slotify"])
-        self.slotify_cb.SetToolTip(
-            "Fuse fine-pitch pad rows into a single slot when the gap between "
-            "pads is narrower than the nozzle, avoiding sub-nozzle walls."
-        )
-        stencil_box.Add(self.slotify_cb, 0, wx.LEFT | wx.RIGHT | wx.BOTTOM, 8)
+        nozzle_hint = wx.StaticText(stencil_parent, label="0.2 mm recommended")
+        nozzle_hint.SetForegroundColour(wx.Colour(120, 120, 120))
+        hint_font = nozzle_hint.GetFont()
+        hint_font.SetPointSize(hint_font.GetPointSize() - 1)
+        nozzle_hint.SetFont(hint_font)
+        stencil_box.Add(nozzle_hint, 0, wx.LEFT | wx.RIGHT | wx.BOTTOM, _BOX_PAD)
 
-        main_sizer.Add(stencil_box, 0, wx.EXPAND | wx.ALL, 10)
+        # ── Alignment ──
+        # « Registration » a disparu des deux cotes : c'est du jargon de
+        # fabrication, et les quatorze traducteurs du site l'avaient deja rendu
+        # par un mot d'alignement ou de positionnement, jamais par son equivalent
+        # d'imprimerie.
+        shoulder_box = self._add_group_box(panel, main_sizer, "Alignment", last=True)
+        shoulder_parent = shoulder_box.GetStaticBox()
 
-        # ── Shoulder Parameters ──
-        shoulder_box = wx.StaticBoxSizer(wx.VERTICAL, panel, "Registration Shoulders")
+        shoulder_box.AddSpacer(_BOX_TOP_EXTRA)
 
-        self.shoulders_cb = wx.CheckBox(panel, label="Enable shoulders (alignment supports)")
+        self.shoulders_cb = wx.CheckBox(shoulder_parent, label="Shoulders")
         self.shoulders_cb.SetValue(self._settings["enable_shoulders"])
         self.shoulders_cb.Bind(wx.EVT_CHECKBOX, self._on_shoulder_toggle)
-        shoulder_box.Add(self.shoulders_cb, 0, wx.ALL, 8)
+        self._labelled_toggle(
+            shoulder_parent, shoulder_box, self.shoulders_cb,
+            "Adds supports to hold the PCB and align the stencil.",
+            wx.ALL,
+        )
 
-        self.shoulder_grid = wx.FlexGridSizer(4, 2, 8, 16)
+        self.shoulder_grid = wx.FlexGridSizer(4, 3, 8, 16)
         self.shoulder_grid.AddGrowableCol(1, 1)
 
+        # Pas de prefixe « Shoulder » sur les deux dimensions : le titre du
+        # groupe le porte deja, comme sur le site.
         self.pcb_thickness_ctrl = self._add_param(
-            panel, self.shoulder_grid, "PCB thickness (mm):", self._settings["pcb_thickness"], 0.1, 5.0,
+            shoulder_parent, self.shoulder_grid, "PCB thickness (mm):",
+            self._settings["pcb_thickness"], 0.1, 5.0,
             "Your PCB board thickness"
         )
         self.shoulder_length_ctrl = self._add_param(
-            panel, self.shoulder_grid, "Shoulder length (mm):", self._settings["shoulder_length"], 1.0, 200.0,
+            shoulder_parent, self.shoulder_grid, "Length (mm):",
+            self._settings["shoulder_length"], 1.0, 200.0,
             "L-bracket length along PCB edge"
         )
         self.shoulder_width_ctrl = self._add_param(
-            panel, self.shoulder_grid, "Shoulder width (mm):", self._settings["shoulder_width"], 0.5, 15.0,
+            shoulder_parent, self.shoulder_grid, "Width (mm):",
+            self._settings["shoulder_width"], 0.5, 15.0,
             "L-bracket wall thickness"
         )
         self.shoulder_clearance_ctrl = self._add_param(
-            panel, self.shoulder_grid, "Clearance (mm):", self._settings["shoulder_clearance"], 0.0, 2.0,
+            shoulder_parent, self.shoulder_grid, "Clearance (mm):",
+            self._settings["shoulder_clearance"], 0.0, 2.0,
             "Gap between PCB edge and shoulder walls"
         )
 
-        shoulder_box.Add(self.shoulder_grid, 0, wx.EXPAND | wx.LEFT | wx.RIGHT | wx.BOTTOM, 8)
-        main_sizer.Add(shoulder_box, 0, wx.EXPAND | wx.LEFT | wx.RIGHT, 10)
+        shoulder_box.Add(self.shoulder_grid, 0,
+                         wx.EXPAND | wx.LEFT | wx.RIGHT | wx.BOTTOM, _BOX_PAD)
 
         # Single key -> control registry. _on_generate (collect) and _on_reset
         # (restore defaults) iterate this instead of maintaining parallel
@@ -338,6 +408,7 @@ class StenchillDialog(wx.Dialog):
             "shrink": self.shrink_ctrl,
             "nozzle_diameter": self.nozzle_ctrl,
             "enable_slotify": self.slotify_cb,
+            "drop_unprintable_grids": self.drop_grids_cb,
             "enable_shoulders": self.shoulders_cb,
             "pcb_thickness": self.pcb_thickness_ctrl,
             "shoulder_length": self.shoulder_length_ctrl,
@@ -512,10 +583,118 @@ class StenchillDialog(wx.Dialog):
         )
         self.SetClientSize(target)
 
+    def _add_group_box(self, panel, main_sizer, title, last=False):
+        """Titre de groupe en StaticText AU-DESSUS d'une StaticBox sans intitule.
+
+        L'intitule natif d'une StaticBox est rogne dans sa zone de jambages sur
+        macOS : le « g » d'« Alignment » ressortait coupe, alors que wx annonce
+        pourtant 22 px reserves pour un texte de 16 avec 3 px de jambage. Le
+        sortir de la boite supprime le probleme par construction, et rapproche
+        la disposition de celle du site, ou le titre de groupe est un paragraphe
+        au-dessus des champs.
+
+        Rend le sizer de la boite, a remplir par l'appelant.
+        """
+        head = wx.StaticText(panel, label=title)
+        font = head.GetFont()
+        font.SetWeight(wx.FONTWEIGHT_BOLD)
+        head.SetFont(font)
+        # Bordures posees separement : le border d'un Add s'applique a TOUS les
+        # cotes marques, donc on ne peut pas y demander 10 sur les cotes et 4
+        # au-dessus. Les intercalaires portent l'ecart vertical.
+        main_sizer.Add(head, 0, wx.LEFT | wx.RIGHT | wx.TOP, _GROUP_MARGIN)
+        main_sizer.AddSpacer(_GROUP_HEAD_GAP)
+
+        box = wx.StaticBoxSizer(wx.VERTICAL, panel, "")
+        main_sizer.Add(box, 0, wx.EXPAND | wx.LEFT | wx.RIGHT, _GROUP_MARGIN)
+        if last:
+            main_sizer.AddSpacer(_GROUP_MARGIN)
+        return box
+
+    def _help_bitmap(self, size):
+        """Dessine la pastille d'aide : disque plein et « i » blanc.
+
+        Dessinee et non prise dans wx.ArtProvider : KiCad REMPLACE le
+        fournisseur de ressources par le sien, si bien que wx.ART_INFORMATION y
+        rend une ampoule et non le cercle attendu. Dessiner la rend independante
+        de l'hote, et n'ajoute aucun fichier au paquet, contrairement a une image
+        qu'il faudrait inscrire dans PLUGIN_FILES.
+        """
+        bitmap = wx.Bitmap(size, size, 32)
+        bitmap.UseAlpha()
+        dc = wx.MemoryDC(bitmap)
+        dc.SetBackground(wx.Brush(wx.Colour(0, 0, 0, 0)))
+        dc.Clear()
+        gc = wx.GraphicsContext.Create(dc)
+        if gc:
+            blue = wx.Colour(70, 130, 220)
+            gc.SetBrush(wx.Brush(blue))
+            gc.SetPen(wx.Pen(blue))
+            gc.DrawEllipse(0.5, 0.5, size - 1, size - 1)
+            gc.SetBrush(wx.Brush(wx.Colour(255, 255, 255)))
+            unit = size / 16.0
+            # Le point, puis la hampe du « i ». Dessines a la main plutot qu'en
+            # texte : a seize pixels une police rend le glyphe illisible.
+            gc.DrawEllipse(size / 2 - 1.1 * unit, 3.2 * unit, 2.2 * unit, 2.2 * unit)
+            gc.DrawRectangle(size / 2 - 1.0 * unit, 6.8 * unit, 2.0 * unit, 6.0 * unit)
+        dc.SelectObject(wx.NullBitmap)
+        return bitmap
+
+    def _help_icon(self, parent, tooltip, title):
+        """Pastille d'aide a cote d'un reglage, comme le ⓘ du site.
+
+        Elle repond au CLIC et pas au survol. Lui donner aussi une infobulle
+        affichait les deux a la fois, qui se chevauchaient ; le libelle et le
+        champ gardent la leur, donc l'aide reste accessible au survol la ou on
+        la cherche naturellement.
+        """
+        size = self.FromDIP(16)
+        # GenericStaticBitmap et non StaticBitmap : sur wxGTK le natif enveloppe
+        # un GtkImage sans fenetre, et les clics souris peuvent ne jamais lui
+        # etre delivres — pastille inerte sous KiCad Linux. La version generique
+        # est un vrai wx.Control, qui recoit ses evenements sur les trois
+        # plateformes.
+        icon = wx.GenericStaticBitmap(parent, bitmap=self._help_bitmap(size))
+        icon.SetName("help-icon")
+        # La correspondance vit sur le dialogue et s'indexe par l'identifiant du
+        # widget : wxPython recree ses objets Python a chaque GetChildren(),
+        # donc un attribut pose sur l'icone ne survivrait pas au parcours de
+        # l'arbre, et SetHelpText est inerte sans fournisseur d'aide installe.
+        # C'est ce registre que lit le handler : une seule source pour le texte.
+        self._help_entries[icon.GetId()] = (title, tooltip)
+        icon.SetCursor(wx.Cursor(wx.CURSOR_HAND))
+        icon.Bind(wx.EVT_LEFT_DOWN, self._on_help_click)
+        return icon
+
+    def _on_help_click(self, event):
+        """Ouvre l'encart d'aide de la pastille cliquee, depuis _help_entries."""
+        icon = event.GetEventObject()
+        title, tooltip = self._help_entries[icon.GetId()]
+        popup = wx.adv.RichToolTip(title, textwrap.fill(tooltip, _HELP_WRAP_COLUMNS))
+        # La meme icone dessinee, et surtout pas wx.ICON_INFORMATION : cette
+        # constante passe elle aussi par le fournisseur de ressources que
+        # KiCad remplace, et l'en-tete de l'encart y montrait une ampoule.
+        popup.SetIcon(self._help_bitmap(self.FromDIP(20)))
+        popup.ShowFor(icon)
+
+    def _labelled_toggle(self, parent, sizer, checkbox, tooltip, border_flags):
+        """Une case a cocher suivie de sa pastille d'aide.
+
+        Pas d'infobulle sur la case : l'encart de la pastille est le SEUL canal
+        d'aide des reglages. Deux canaux redondants exigeaient de garder leurs
+        textes accordes pour toujours, et on a deja paye une superposition.
+        """
+        row = wx.BoxSizer(wx.HORIZONTAL)
+        row.Add(checkbox, 0, wx.ALIGN_CENTER_VERTICAL | wx.RIGHT, 6)
+        row.Add(self._help_icon(parent, tooltip, checkbox.GetLabel()),
+                0, wx.ALIGN_CENTER_VERTICAL)
+        sizer.Add(row, 0, border_flags, _BOX_PAD)
+
     def _add_param(self, panel, grid, label, default, min_val, max_val, tooltip):
         """Add a labeled SpinCtrlDouble to the grid."""
+        # Ni le libelle ni le champ ne portent d'infobulle : l'encart de la
+        # pastille est le seul canal d'aide (voir _labelled_toggle).
         lbl = wx.StaticText(panel, label=label)
-        lbl.SetToolTip(tooltip)
         grid.Add(lbl, 0, wx.ALIGN_CENTER_VERTICAL)
 
         # Set the value as a float via SetValue, NOT via the constructor's string
@@ -526,13 +705,16 @@ class StenchillDialog(wx.Dialog):
         ctrl = wx.SpinCtrlDouble(panel, min=min_val, max=max_val, inc=0.05)
         ctrl.SetDigits(2)
         ctrl.SetValue(float(default))
-        ctrl.SetToolTip(tooltip)
         # A SpinCtrlDouble eats the mouse wheel to change its value, which stops
         # the ScrolledWindow from scrolling when the cursor is over a field.
         # Redirect the wheel to page scrolling UNLESS the field is focused (see
         # _on_param_wheel), so hovering scrolls but a clicked field still adjusts.
         ctrl.Bind(wx.EVT_MOUSEWHEEL, self._on_param_wheel)
         grid.Add(ctrl, 1, wx.EXPAND)
+        # Titre de l'encart : le nom du reglage seul. L'unite est deja dans le
+        # libelle juste a cote, sur lequel l'encart pointe.
+        title = label.split("(")[0].strip().rstrip(":")
+        grid.Add(self._help_icon(panel, tooltip, title), 0, wx.ALIGN_CENTER_VERTICAL)
 
         return ctrl
 
@@ -551,11 +733,17 @@ class StenchillDialog(wx.Dialog):
         self.panel.ScrollLines(lines)
 
     def _on_shoulder_toggle(self, event):
-        """Enable/disable shoulder parameters based on checkbox."""
+        """Enable/disable shoulder parameters based on checkbox.
+
+        Les pastilles d'aide sont epargnees : leur aide au CLIC doit rester
+        joignable quand les champs sont grises, c'est-a-dire exactement quand on
+        veut lire a quoi sert un reglage avant de l'activer. Une fenetre
+        desactivee ne recoit plus EVT_LEFT_DOWN.
+        """
         enabled = self.shoulders_cb.GetValue()
         for child in self.shoulder_grid.GetChildren():
             window = child.GetWindow()
-            if window:
+            if window and window.GetName() != "help-icon":
                 window.Enable(enabled)
 
     def _on_generate(self, event):
@@ -663,6 +851,7 @@ class StenchillDialog(wx.Dialog):
                     shoulder_clearance=params["shoulder_clearance"],
                     nozzle_diameter=params["nozzle_diameter"],
                     enable_slotify=params["enable_slotify"],
+                    drop_unprintable_grids=params["drop_unprintable_grids"],
                 )
             finally:
                 # Clean up temp Gerber ZIP
@@ -856,7 +1045,8 @@ class StenchillDialog(wx.Dialog):
                 self.result_text.SetLabel(f"❌  Could not open 3D view: {error}")
                 self._refit_scroll()
                 return
-            if _is_trusted_view_url(url):
+            from .api_client import is_trusted_view_url
+            if is_trusted_view_url(url):
                 try:
                     opened = webbrowser.open(url)
                 except Exception:  # noqa: BLE001

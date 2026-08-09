@@ -14,6 +14,7 @@ import re
 import ssl
 import tempfile
 import uuid
+from urllib.parse import urlparse
 from urllib.request import Request, urlopen
 from urllib.error import HTTPError, URLError
 
@@ -215,7 +216,7 @@ def _dispatch_sse_event(event_type, data_str, on_progress, on_queued):
 
 def _build_multipart(zip_path, thickness, shrink, pcb_thickness, shoulder_length,
                      shoulder_width, enable_shoulders, shoulder_clearance, nozzle_diameter,
-                     enable_slotify):
+                     enable_slotify, drop_unprintable_grids):
     """Build multipart body and headers for the API request."""
     boundary = f"----StenchillBoundary{uuid.uuid4().hex}"
 
@@ -238,6 +239,7 @@ def _build_multipart(zip_path, thickness, shrink, pcb_thickness, shoulder_length
         "shoulderClearance": str(shoulder_clearance),
         "nozzleDiameter": str(nozzle_diameter),
         "enableSlotify": str(enable_slotify).lower(),
+        "dropUnprintableGrids": str(drop_unprintable_grids).lower(),
     }
 
     param_parts = b""
@@ -309,6 +311,34 @@ def share_stencil(zip_path: str, params: dict | None = None) -> str:
         raise ApiError(f"Share failed (HTTP {e.code}): {detail}", status_code=e.code)
     except URLError as e:
         raise ApiError(f"Could not reach the server: {e.reason}")
+
+
+def is_trusted_view_url(url) -> bool:
+    """The /view URL comes from the share response; only hand trusted links to
+    the browser. Anything else is shown as plain text instead of opened, so a
+    misbehaving backend can't redirect the user off-site. Trusted:
+    https://stenchill.com (production) or a localhost / 127.0.0.1 URL on any
+    port (local development against a dev backend).
+
+    Vit ici et non dans dialog.py depuis le 2026-08-09 : c'est la sortie de
+    ``share_stencil`` que cette fonction filtre, et dialog.py importe wx, ce qui
+    la rendait intestable hors KiCad.
+    """
+    # Refus de tout antislash AVANT le parse : urlparse et les navigateurs
+    # WHATWG ne s'accordent pas sur la fin de l'autorite. Sur
+    # « https://evil.com\\@stenchill.com/x », urlparse lit stenchill.com comme
+    # hote, mais Chrome et Firefox coupent l'autorite au « \\ » et naviguent
+    # vers evil.com — exactement le detournement que ce filtre existe pour
+    # empecher. Aucune URL legitime du backend n'en contient.
+    if not isinstance(url, str) or "\\" in url:
+        return False
+    try:
+        parsed = urlparse(url)
+    except Exception:
+        return False
+    if parsed.hostname in ("localhost", "127.0.0.1"):
+        return parsed.scheme in ("http", "https")
+    return parsed.scheme == "https" and parsed.hostname in ("stenchill.com", "www.stenchill.com")
 
 
 def _flush_sse_event(event_type, data_lines, on_progress, on_queued):
@@ -392,6 +422,7 @@ def generate_stencil_stream(
     shoulder_clearance: float = 0.3,
     nozzle_diameter: float = 0.4,
     enable_slotify: bool = True,
+    drop_unprintable_grids: bool = True,
 ) -> str:
     """
     SSE streaming generation - returns path to the result ZIP.
@@ -414,7 +445,8 @@ def generate_stencil_stream(
     """
     body, headers = _build_multipart(zip_path, thickness, shrink, pcb_thickness,
                                      shoulder_length, shoulder_width, enable_shoulders,
-                                     shoulder_clearance, nozzle_diameter, enable_slotify)
+                                     shoulder_clearance, nozzle_diameter, enable_slotify,
+                                     drop_unprintable_grids)
 
     req = Request(STREAM_URL, data=body, headers=headers, method="POST")
     ctx = _ssl_context()
