@@ -326,19 +326,19 @@ class StenchillDialog(wx.Dialog):
         grid.AddGrowableCol(1, 1)
 
         self.thickness_ctrl = self._add_param(
-            stencil_parent, grid, "Thickness (mm):", self._settings["thickness"], 0.05, 1.0,
+            stencil_parent, grid, "Thickness (mm):", self._settings["thickness"], 0.1, 0.6,
             "Stencil thickness. Defines solder paste deposit. "
             "0.3-0.4 mm for most SMD components."
         )
         self.shrink_ctrl = self._add_param(
-            stencil_parent, grid, "Shrink (mm):", self._settings["shrink"], -1.0, 5.0,
+            stencil_parent, grid, "Shrink (mm):", self._settings["shrink"], -0.2, 0.3,
             "Pad reduction - negative values enlarge pads"
         )
         # La recommandation vit sous le champ, comme le mat-hint du site, et non
         # dans le libelle : « Nozzle (mm), 0.2 rec.: » etait illisible.
         self.nozzle_ctrl = self._add_param(
             stencil_parent, grid, "Nozzle (mm):", self._settings["nozzle_diameter"],
-            0.1, 1.5,
+            0.1, 0.8,
             "Your 3D printer nozzle size - 0.2 mm recommended for best results"
         )
 
@@ -378,7 +378,7 @@ class StenchillDialog(wx.Dialog):
         # groupe le porte deja, comme sur le site.
         self.pcb_thickness_ctrl = self._add_param(
             shoulder_parent, self.shoulder_grid, "PCB thickness (mm):",
-            self._settings["pcb_thickness"], 0.1, 5.0,
+            self._settings["pcb_thickness"], 0.4, 3.2,
             "Your PCB board thickness"
         )
         self.shoulder_length_ctrl = self._add_param(
@@ -388,12 +388,12 @@ class StenchillDialog(wx.Dialog):
         )
         self.shoulder_width_ctrl = self._add_param(
             shoulder_parent, self.shoulder_grid, "Width (mm):",
-            self._settings["shoulder_width"], 0.5, 15.0,
+            self._settings["shoulder_width"], 0.5, 8.0,
             "L-bracket wall thickness"
         )
         self.shoulder_clearance_ctrl = self._add_param(
             shoulder_parent, self.shoulder_grid, "Clearance (mm):",
-            self._settings["shoulder_clearance"], 0.0, 2.0,
+            self._settings["shoulder_clearance"], 0.0, 1.0,
             "Gap between PCB edge and shoulder walls"
         )
 
