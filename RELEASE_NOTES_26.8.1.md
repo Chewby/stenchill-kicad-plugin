@@ -29,6 +29,12 @@ hardening.
   alignment. The panel now says what it does.
 - The nozzle recommendation moved out of the field label, which read
   "Nozzle (mm), 0.2 rec.:", and sits under the field as a plain hint.
+- **The value ranges match the website too, and they are narrower than before.**
+  Shrink used to go up to 5 mm, which strips 10 mm of width from every aperture
+  and leaves nothing to print; it now stops at 0.3. Thickness, PCB thickness,
+  shoulder width and clearance were tightened the same way. The nozzle floor is
+  untouched at 0.1 mm: that is the nozzle you want for a fine-pitch BGA, and
+  only its 1.5 mm ceiling was unreasonable.
 
 ## Fixed
 - Group titles were clipped on macOS: the descender of the "g" in "Alignment"
