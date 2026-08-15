@@ -255,7 +255,7 @@ class StenchillDialog(wx.Dialog):
 
         subtitle = wx.StaticText(
             panel,
-            label="Export paste layers from your PCB and generate STL files",
+            label="Export paste layers from your PCB and generate STL and 3MF files",
             style=wx.ALIGN_CENTER
         )
         subtitle.SetForegroundColour(wx.Colour(100, 100, 100))
@@ -870,7 +870,7 @@ class StenchillDialog(wx.Dialog):
         if token != self._gen_token:
             return
 
-        ui(self._set_status, "Saving STL files...")
+        ui(self._set_status, "Saving mesh files...")
 
         # Create subfolder and extract STL files
         timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
@@ -900,7 +900,7 @@ class StenchillDialog(wx.Dialog):
             folder_name = os.path.basename(gen_dir)
             ui(self._on_success, f"Saved: {files_str}\nFolder: {folder_name}", gen_dir, params)
         else:
-            ui(self._on_error, "No STL files found in the API response.")
+            ui(self._on_error, "No mesh files found in the API response.")
 
     def _set_status(self, text):
         self.status_text.SetLabel(text)
