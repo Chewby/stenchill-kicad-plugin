@@ -29,6 +29,8 @@ hardening.
   alignment. The panel now says what it does.
 - The nozzle recommendation moved out of the field label, which read
   "Nozzle (mm), 0.2 rec.:", and sits under the field as a plain hint.
+- **The dialog says STL and 3MF.** Every generation writes a `.3mf` next to the
+  `.stl`, but the texts only ever announced STL files.
 - **The value ranges match the website too, and they are narrower than before.**
   Shrink used to go up to 5 mm, which strips 10 mm of width from every aperture
   and leaves nothing to print; it now stops at 0.3. Thickness, PCB thickness,
@@ -58,6 +60,8 @@ hardening.
 - Several of the fixes above were surfaced by that suite or by a full code
   review of the plugin, including checkboxes parented to the wrong widget,
   which macOS tolerates but Windows and GTK do not.
+- The ten generation parameters now travel as a single dict instead of ten
+  keyword arguments.
 - Still zero issues under static analysis.
 
 ---
