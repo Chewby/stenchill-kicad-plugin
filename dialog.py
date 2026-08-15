@@ -839,19 +839,10 @@ class StenchillDialog(wx.Dialog):
             try:
                 result_zip = generate_stencil_stream(
                     zip_path=zip_path,
+                    params=params,
                     on_progress=on_progress,
                     on_queued=on_queued,
                     cancel_event=cancel_event,
-                    thickness=params["thickness"],
-                    shrink=params["shrink"],
-                    pcb_thickness=params["pcb_thickness"],
-                    shoulder_length=params["shoulder_length"],
-                    shoulder_width=params["shoulder_width"],
-                    enable_shoulders=params["enable_shoulders"],
-                    shoulder_clearance=params["shoulder_clearance"],
-                    nozzle_diameter=params["nozzle_diameter"],
-                    enable_slotify=params["enable_slotify"],
-                    drop_unprintable_grids=params["drop_unprintable_grids"],
                 )
             finally:
                 # Clean up temp Gerber ZIP

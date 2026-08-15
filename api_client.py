@@ -214,6 +214,25 @@ def _dispatch_sse_event(event_type, data_str, on_progress, on_queued):
     return None
 
 
+# Defaults matching the web UI (see dialog.py's own _DEFAULTS, which the
+# dialog's params dict is built from). generate_stencil_stream merges its
+# caller-supplied params dict onto this, so a call without ``params`` (or one
+# that omits a key) behaves exactly as it did when these were 10 keyword
+# arguments with these same defaults.
+_DEFAULT_PARAMS = {
+    "thickness": 0.4,
+    "shrink": 0.0,
+    "pcb_thickness": 1.6,
+    "shoulder_length": 15.0,
+    "shoulder_width": 3.0,
+    "enable_shoulders": True,
+    "shoulder_clearance": 0.3,
+    "nozzle_diameter": 0.4,
+    "enable_slotify": True,
+    "drop_unprintable_grids": True,
+}
+
+
 def _build_multipart(zip_path, thickness, shrink, pcb_thickness, shoulder_length,
                      shoulder_width, enable_shoulders, shoulder_clearance, nozzle_diameter,
                      enable_slotify, drop_unprintable_grids):
@@ -410,31 +429,27 @@ def _download_result(download_url, ctx, cancel_event):
 
 def generate_stencil_stream(
     zip_path: str,
+    params: dict | None = None,
     on_progress=None,
     on_queued=None,
     cancel_event=None,
-    thickness: float = 0.4,
-    shrink: float = 0.0,
-    pcb_thickness: float = 1.6,
-    shoulder_length: float = 15.0,
-    shoulder_width: float = 3.0,
-    enable_shoulders: bool = True,
-    shoulder_clearance: float = 0.3,
-    nozzle_diameter: float = 0.4,
-    enable_slotify: bool = True,
-    drop_unprintable_grids: bool = True,
 ) -> str:
     """
     SSE streaming generation - returns path to the result ZIP.
 
     Args:
         zip_path: Path to the Gerber ZIP file.
+        params: Generation parameters (thickness, shrink, pcb_thickness,
+            shoulder_length, shoulder_width, enable_shoulders,
+            shoulder_clearance, nozzle_diameter, enable_slotify,
+            drop_unprintable_grids). Any key omitted falls back to
+            _DEFAULT_PARAMS, so a call without ``params`` behaves exactly like
+            the pre-refactor defaults.
         on_progress: Callback(step: int, total: int, label: str, label_text: str,
             face_progress: list) called for each progress event.
         on_queued: Callback(position: int, queue_depth: int, eta_seconds: int) called when request is queued.
         cancel_event: Optional threading.Event; when set, the stream is
             abandoned (GenerationCancelled) and the result is never downloaded.
-        Other args: Generation parameters.
 
     Returns:
         Path to the downloaded result ZIP containing STL files.
@@ -443,10 +458,12 @@ def generate_stencil_stream(
         GenerationCancelled: cancel_event was set during the stream.
         ApiError: server or network error.
     """
-    body, headers = _build_multipart(zip_path, thickness, shrink, pcb_thickness,
-                                     shoulder_length, shoulder_width, enable_shoulders,
-                                     shoulder_clearance, nozzle_diameter, enable_slotify,
-                                     drop_unprintable_grids)
+    merged = {**_DEFAULT_PARAMS, **(params or {})}
+    body, headers = _build_multipart(zip_path, merged["thickness"], merged["shrink"],
+                                     merged["pcb_thickness"], merged["shoulder_length"],
+                                     merged["shoulder_width"], merged["enable_shoulders"],
+                                     merged["shoulder_clearance"], merged["nozzle_diameter"],
+                                     merged["enable_slotify"], merged["drop_unprintable_grids"])
 
     req = Request(STREAM_URL, data=body, headers=headers, method="POST")
     ctx = _ssl_context()
