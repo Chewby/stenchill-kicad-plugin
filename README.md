@@ -40,13 +40,13 @@ The plugin exports your paste layers as Gerber files, sends them to the Stenchil
 
 | Parameter | Default | Range | Description |
 |-----------|---------|-------|-------------|
-| Thickness | 0.4 mm | 0.05–10 | Stencil plate thickness |
-| Shrink | 0 mm | -1–5 | Pad reduction (negative = enlarge) |
-| Nozzle diameter | 0.4 mm | 0.1–2 | Adaptive compensation threshold |
-| PCB thickness | 1.6 mm | 0.1–10 | Shoulder height |
-| Shoulder length | 15 mm | 1–500 | L-bracket length |
-| Shoulder width | 3 mm | 0.5–50 | L-bracket wall thickness |
-| Shoulder clearance | 0.3 mm | 0–5 | Gap PCB ↔ shoulders |
+| Thickness | 0.4 mm | 0.1–0.6 | Stencil plate thickness |
+| Shrink | 0 mm | -0.2–0.3 | Pad reduction (negative = enlarge) |
+| Nozzle diameter | 0.4 mm | 0.1–0.8 | Adaptive compensation threshold |
+| PCB thickness | 1.6 mm | 0.4–3.2 | Shoulder height |
+| Shoulder length | 15 mm | 1–200 | L-bracket length |
+| Shoulder width | 3 mm | 0.5–8 | L-bracket wall thickness |
+| Shoulder clearance | 0.3 mm | 0–1 | Gap PCB ↔ shoulders |
 
 ## Requirements
 
